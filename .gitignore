@@ -3,6 +3,7 @@
 /data/
 /logs/
 /backups/
+/exports/
 /host_config.json
 /config/host_config.json
 .env

@@ -145,6 +145,7 @@ Date November 2026
       }
       if (r.fps) { S.fps = r.fps; }
       setTimeout(syncQcState, 0);
+      setTimeout(syncExportState, 0);
        
       S.subtasks = Array.isArray(r.subtasks) ? r.subtasks.slice() : loadSubtasks(S.dir);
       S.episodes.forEach(function (e) {
@@ -1274,6 +1275,84 @@ Date November 2026
   function closeZoom() {
     if (zoomEl) { zoomEl.hidden = true; }
   }
+
+  var exportTimer = null;
+  var exportGeneration = 0;
+
+  function renderExport(job) {
+    var button = $("#rv-export");
+    var status = $("#rv-export-status");
+    if (!button || !status) { return; }
+    var running = job && ["queued", "running", "packaging"].indexOf(job.state) >= 0;
+    button.disabled = !!running;
+    button.textContent = running ? "导出中 " + job.done + "/" + job.total : "导出 LeRobot";
+    status.hidden = !job;
+    status.textContent = "";
+    if (!job) { return; }
+    if (job.state === "done") {
+      status.appendChild(document.createTextNode("已导出 " + job.total + " 条合格数据。服务器位置：" + job.output_path + " "));
+      if (job.download_url) {
+        var link = document.createElement("a");
+        link.textContent = "下载 LeRobot 数据集";
+        link.href = job.download_url;
+        link.setAttribute("download", "");
+        link.addEventListener("click", function (event) {
+          event.preventDefault();
+          api("/lerobot-export?id=" + encodeURIComponent(job.id)).then(function (fresh) {
+            var a = document.createElement("a");
+            a.href = fresh.download_url;
+            a.setAttribute("download", "");
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+          }).catch(function (e) { toast("下载失败：" + e.message); });
+        });
+        status.appendChild(link);
+      }
+    } else if (job.state === "error") {
+      status.textContent = "导出失败：" + job.error;
+    } else {
+      status.textContent = job.state === "packaging" ? "转换完成，正在生成下载文件…"
+        : "正在导出合格数据：" + job.done + "/" + job.total + (job.current ? "，" + job.current : "");
+    }
+  }
+
+  function syncExportState() {
+    clearTimeout(exportTimer);
+    var generation = ++exportGeneration;
+    var dir = S.dir;
+    if (!dir) { renderExport(null); return; }
+    function tick() {
+      api("/lerobot-export?dir=" + encodeURIComponent(dir)).then(function (job) {
+        if (generation !== exportGeneration || dir !== S.dir) { return; }
+        renderExport(job);
+        if (job && ["queued", "running", "packaging"].indexOf(job.state) >= 0) {
+          exportTimer = setTimeout(tick, 1500);
+        }
+      }).catch(function (e) {
+        if (generation !== exportGeneration || dir !== S.dir) { return; }
+        var status = $("#rv-export-status");
+        if (status) { status.hidden = false; status.textContent = "导出状态读取失败，正在重试：" + e.message; }
+        exportTimer = setTimeout(tick, 5000);
+      });
+    }
+    renderExport(null);
+    tick();
+  }
+
+  bindNav("rv-export", function () {
+    if (!S.dir) { return; }
+    var dir = S.dir;
+    var button = $("#rv-export");
+    button.disabled = true;
+    button.textContent = "导出启动中…";
+    api("/lerobot-export", { method: "POST", body: { dir: dir } }).then(function () {
+      if (dir === S.dir) { syncExportState(); }
+    }).catch(function (e) {
+      if (dir === S.dir) { renderExport(null); }
+      toast("导出失败：" + e.message);
+    });
+  });
 
   var qcTimer = null;
 

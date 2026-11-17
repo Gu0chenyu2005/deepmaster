@@ -1170,6 +1170,7 @@ select.cfg__in, select.input { font-family: var(--dm-font-text); cursor: pointer
   color: var(--dm-ink-3);
 }
 .rv-msg.is-bad { color: var(--dm-red); }
+#rv-export-status { overflow-wrap: anywhere; margin-bottom: 12px; }
 .rv-kv { margin: 0 0 10px; }
 .rv-kv > div {
   display: flex;

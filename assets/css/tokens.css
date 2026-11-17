@@ -1,0 +1,172 @@
+/*
+Copyright (c) 2026 deeprobotics
+Author Chenyu Guo
+Date November 2026
+*/
+/* 全局设计变量：字体、颜色、间距与动效。 */
+:root {
+  --dm-font-display: system-ui, -apple-system, "SF Pro Display", "Segoe UI", Roboto,
+                     "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  --dm-font-text: system-ui, -apple-system, "SF Pro Text", "Segoe UI", Roboto,
+                  "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  --dm-font-mono: "JetBrains Mono", "SF Mono", "SFMono-Regular", ui-monospace,
+                  "Cascadia Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --dm-font-sub: "Liberation Sans", "Nimbus Sans", "DejaVu Sans",
+                 "Noto Sans CJK SC", "Noto Sans CJK JP", system-ui,
+                 "Helvetica Neue", Arial, sans-serif;
+  --dm-blue: rgb(0, 113, 227);
+  --dm-blue-hover: #0076df;
+  --dm-blue-active: #006edb;
+  --dm-link: rgb(0, 102, 204);
+  --dm-link-dark: rgb(41, 151, 255);
+  --dm-ink: rgb(29, 29, 31);
+  --dm-ink-2: rgb(66, 66, 69);
+  --dm-ink-3: rgb(110, 110, 115);
+  --dm-ink-4: rgb(134, 134, 139);
+  --dm-ink-quiet: rgba(0, 0, 0, .56);
+  --dm-ink-faint: rgba(0, 0, 0, .48);
+  --dm-surface: rgb(255, 255, 255);
+  --dm-surface-2: rgb(250, 250, 252);
+  --dm-surface-3: rgb(245, 245, 247);
+  --dm-surface-4: rgb(232, 232, 237);
+  --dm-hairline: rgb(210, 210, 215);
+  --dm-hairline-soft: rgb(232, 232, 237);
+  --dm-void: rgb(0, 0, 0);
+  --dm-dark: rgb(22, 22, 23);
+  --dm-dark-2: rgb(29, 29, 31);
+  --dm-dark-3: rgb(44, 44, 46);
+  --dm-dark-hairline: rgba(255, 255, 255, .14);
+  --dm-dark-hairline-soft: rgba(255, 255, 255, .08);
+  --dm-on-dark: rgb(245, 245, 247);
+  --dm-on-dark-2: rgba(255, 255, 255, .80);
+  --dm-on-dark-3: rgba(255, 255, 255, .56);
+  --dm-on-dark-4: rgba(255, 255, 255, .40);
+  --dm-green: rgb(3, 161, 14);
+  --dm-green-soft: rgb(0, 217, 89);
+  --dm-green-bg: rgba(3, 161, 14, .10);
+  --dm-amber: rgb(182, 68, 0);
+  --dm-amber-bg: rgba(245, 99, 0, .12);
+  --dm-red: rgb(227, 0, 0);
+  --dm-red-bg: rgba(227, 0, 0, .10);
+  --dm-glass-bg: rgba(250, 250, 252, .80);
+  --dm-glass-filter: saturate(180%) blur(20px);
+  --dm-float-bg: rgba(255, 255, 255, .78);
+  --dm-float-filter: saturate(180%) blur(28px);
+  --dm-dark-glass: rgba(22, 22, 23, .62);
+  --dm-dark-glass-filter: saturate(160%) blur(40px);
+  --dm-r-xs: 5px;
+  --dm-r-sm: 8px;
+  --dm-r-md: 10px;
+  --dm-r-lg: 12px;
+  --dm-r-xl: 18px;
+  --dm-r-2xl: 22px;
+  --dm-r-3xl: 28px;
+  --dm-r-pill: 980px;
+  --dm-shadow-1: 0 1px 2px rgba(0, 0, 0, .04), 0 4px 12px rgba(0, 0, 0, .04);
+  --dm-shadow-2: 0 2px 6px rgba(0, 0, 0, .05), 0 12px 32px rgba(0, 0, 0, .07);
+  --dm-shadow-3: 0 8px 20px rgba(0, 0, 0, .10), 0 30px 70px rgba(0, 0, 0, .16);
+  --dm-shadow-dark: 0 20px 60px rgba(0, 0, 0, .55), 0 2px 8px rgba(0, 0, 0, .40);
+  --dm-focus-light: 0 0 0 4px rgba(0, 113, 227, .28);
+  --dm-focus-dark: 0 0 0 4px rgba(41, 151, 255, .40);
+  --dm-ease: cubic-bezier(.4, 0, .2, 1);
+  --dm-ease-out: cubic-bezier(.16, 1, .3, 1);
+  --dm-ease-spring: cubic-bezier(.16, 1, .3, 1);
+  --dm-ease-spring: linear(
+    0, .2268 9.09%, .5357 18.18%, .7497 27.27%, .8733 36.36%,
+    .9384 45.45%, .9708 54.55%, .9864 63.64%, .9938 72.73%,
+    .9975 81.82%, .999 90.91%, 1
+  );
+  --dm-ease-spring-bounce: cubic-bezier(.16, 1, .3, 1);
+  --dm-ease-spring-bounce: linear(
+    0, .2018 7.14%, .5256 14.29%, .7764 21.43%, .9223 28.57%,
+    .9898 35.71%, 1.0125 42.86%, 1.0147 50%, 1.0104 57.14%,
+    1.0057 64.29%, 1.0025 71.43%, 1.0009 78.57%, 1.0003 85.71%, 1
+  );
+
+  --dm-t-press: .1s var(--dm-ease-out);
+  --dm-t-fast: .18s var(--dm-ease);
+  --dm-t: .32s var(--dm-ease);
+  --dm-t-spring: .55s var(--dm-ease-spring);
+  --dm-t-spring-bounce: .7s var(--dm-ease-spring-bounce);
+  --dm-t-slow: .6s var(--dm-ease-out);
+  --dm-rail-w: 228px;
+  --dm-pad: clamp(20px, 2.4vw, 36px);
+  --dm-max: 1360px;
+  --dm-ease-power1: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  --dm-ease-power2: cubic-bezier(0.215, 0.61, 0.355, 1);
+  --dm-ease-power3: cubic-bezier(0.165, 0.84, 0.44, 1);
+  --dm-ease-power4: cubic-bezier(0.075, 0.82, 0.165, 1);
+  --dm-ease-back:   cubic-bezier(0.34, 1.36, 0.64, 1);
+  --dm-t-gsap:      .3s var(--dm-ease-power2);
+  --dm-t-gsap2:     .4s var(--dm-ease-power3);
+  --dm-t-gsap3:     .5s var(--dm-ease-power4);
+  --dm-t-gsap-slow: .6s var(--dm-ease-power3);
+  --dm-stagger: .09s;
+}
+.dm-display,
+.dm-headline,
+.dm-title,
+.dm-subhead {
+  font-family: var(--dm-font-display);
+  font-optical-sizing: auto;
+  text-wrap: balance;
+}
+
+.dm-display   { font-size: 56px; line-height: 1.0714; font-weight: 600; letter-spacing: -.005em; }
+.dm-headline  { font-size: 48px; line-height: 1.0835; font-weight: 600; letter-spacing: -.002em; }
+.dm-title     { font-size: 28px; line-height: 1.1429; font-weight: 400; letter-spacing: 0; }
+.dm-subhead   { font-size: 24px; line-height: 1.1667; font-weight: 400; letter-spacing: .004em; }
+.dm-body      { font-family: var(--dm-font-text); font-size: 17px; line-height: 1.4706; font-weight: 400; letter-spacing: 0; }
+.dm-callout   { font-family: var(--dm-font-text); font-size: 19px; line-height: 1.2105; font-weight: 400; letter-spacing: .004em; }
+.dm-footnote  { font-family: var(--dm-font-text); font-size: 14px; line-height: 1.2858; font-weight: 400; letter-spacing: 0; }
+.dm-caption   { font-family: var(--dm-font-text); font-size: 12px; line-height: 1.3334; font-weight: 400; letter-spacing: .006em; }
+:lang(zh) .dm-display,
+:lang(zh) .dm-headline,
+:lang(zh) .dm-title,
+:lang(zh) .dm-subhead,
+:lang(zh) .dm-body,
+:lang(zh) .dm-callout,
+:lang(zh) .dm-footnote,
+:lang(zh) .dm-caption { letter-spacing: 0; }
+
+@media (max-width: 1068px) {
+  .dm-display  { font-size: 48px; }
+  .dm-headline { font-size: 40px; line-height: 1.10; letter-spacing: 0; }
+  .dm-title    { font-size: 24px; }
+  .dm-subhead  { font-size: 21px; }
+}
+
+@media (max-width: 734px) {
+  .dm-display  { font-size: 40px; }
+  .dm-headline { font-size: 32px; }
+  .dm-title    { font-size: 21px; }
+  .dm-subhead  { font-size: 19px; }
+  .dm-callout  { font-size: 17px; line-height: 1.3529; letter-spacing: 0; }
+}
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --dm-glass-bg: rgb(250, 250, 252);
+    --dm-glass-filter: none;
+    --dm-float-bg: rgb(255, 255, 255);
+    --dm-float-filter: none;
+    --dm-dark-glass: rgb(22, 22, 23);
+    --dm-dark-glass-filter: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --dm-hairline: rgb(120, 120, 125);
+    --dm-hairline-soft: rgb(160, 160, 165);
+    --dm-ink-3: rgb(72, 72, 76);
+    --dm-ink-4: rgb(72, 72, 76);
+    --dm-on-dark-3: rgba(255, 255, 255, .78);
+    --dm-on-dark-4: rgba(255, 255, 255, .68);
+    --dm-shadow-1: 0 0 0 1px rgba(0, 0, 0, .55);
+    --dm-shadow-2: 0 0 0 1px rgba(0, 0, 0, .55), 0 8px 24px rgba(0, 0, 0, .14);
+    --dm-glass-bg: rgb(250, 250, 252);
+    --dm-glass-filter: none;
+    --dm-float-bg: rgb(255, 255, 255);
+    --dm-float-filter: none;
+  }
+}

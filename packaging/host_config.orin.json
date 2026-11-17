@@ -1,0 +1,22 @@
+{
+  "dds_ip": "10.21.31.104",
+  "dds_username": "user",
+  "dds_password": "",
+  "k7_dir": "/home/user",
+  "k7_lib_path": "/home/user",
+  "k7_bin": "K7Master3",
+  "k7_sethome_bin": "SetHome",
+  "k7_taskset": "6,7",
+  "k7_chrt": "90",
+  "rl_deploy_dir": "/opt/dm-collect/prog/rl_deploy",
+  "rl_deploy_build": "build",
+  "rl_deploy_bin": "rl_deploy",
+  "robot_service_dir": "/opt/dm-collect/prog/service",
+  "robot_service_script": "runService.sh",
+  "ros_setup": "/opt/ros/humble/setup.bash",
+  "cam_viewer_script": "/opt/dm-collect/cam/camera_shm_viewer.py",
+  "cam_viewer_port": "5000",
+  "record_fps": "15",
+  "imu_topic": "/IMU",
+  "local_data_dir": "/opt/dm-collect/data"
+}

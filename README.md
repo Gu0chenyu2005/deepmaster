@@ -13,3 +13,5 @@
 部署：[服务端](packaging/README-server.md)  [采集端](packaging/README-orin.md)
 
 网页地址：`http://服务器IP:8790`。连接在线设备后，在“程序配置”中填写 DDS 主机信息。
+
+Version:1.0.0

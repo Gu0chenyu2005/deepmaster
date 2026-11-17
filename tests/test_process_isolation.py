@@ -81,7 +81,7 @@ class ProcessIsolationTests(unittest.TestCase):
             session = Path(tmp) / "session"
             self.assertEqual(agent.merge_cfg({"run_data_dir": str(session)})["local_data_dir"],
                              str(session))
-            self.assertTrue(session.is_dir())
+            self.assertFalse(session.exists())
 
 
 if __name__ == "__main__":

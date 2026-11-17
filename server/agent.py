@@ -104,7 +104,6 @@ def merge_cfg(request_cfg):
         candidate = os.path.realpath(os.path.expanduser(os.path.expandvars(str(requested))))
         if candidate != root and not candidate.startswith(root + os.sep):
             raise ValueError("采集目录不在采集端数据根目录内")
-        os.makedirs(candidate, exist_ok=True)
         cfg["local_data_dir"] = candidate
     return cfg
 
@@ -513,6 +512,25 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self._authorized():
             return self._err(401, "采集端请求未授权")
+
+        if head == "files" and len(rest) >= 2 and rest[1] == "rmdir-empty":
+            body = self._body()
+            try:
+                p = safe_path(body.get("dir"))
+                if p == os.path.realpath(data_root()):
+                    return self._err(400, "不允许删除数据根目录")
+                try:
+                    os.rmdir(p)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    if os.path.isdir(p) and os.listdir(p):
+                        return self._ok({"empty": False})
+                    raise
+                invalidate_archive(body.get("dir"))
+                return self._ok({"empty": True})
+            except (ValueError, OSError) as e:
+                return self._err(400, str(e))
 
         if head == "files" and len(rest) >= 2 and rest[1] == "rmdir":
             body = self._body()

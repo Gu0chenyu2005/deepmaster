@@ -873,6 +873,7 @@ Date November 2026
     var n = folder.records || folder.episodes || 0;
     var html = '<p class="modal__line">将删除文件夹 <b>' + escapeHtml(name) + '</b> 及其中的 '
       + (n ? (n + " 条录制数据") : "全部数据") + '。</p>'
+      + '<p class="modal__line">仅删除采集端文件，服务端已上传的数据和审核记录保留。</p>'
       + '<p class="modal__line modal__line--warn">删除后无法恢复，请确认。</p>';
     return openModal({
       title: "删除文件夹",
@@ -1221,7 +1222,7 @@ Date November 2026
     var dir = fromDir || capDir || activeSession && activeSession.dirPath || dataDir();
     if (!dir || !name || !window.dmApi) { return; }
      
-    window.dmApi.deleteRecord(dir, name, remoteMode() || !!activeSession).then(function () {
+    window.dmApi.deleteRecord(dir, name, true).then(function () {
       toast("已删除：" + name);
       refreshRecords();
     }).catch(function (e) { toast("删除失败：" + (e.message || e)); });
@@ -1292,6 +1293,13 @@ Date November 2026
     logLine("!! " + title, "err");
     if (detail) { logLine(detail, "err"); }
     var retry = { folder: sessionFolder, cfg: cfgForRetry };
+    var failedSession = activeSession;
+    var cleanup = failedSession && window.dmApi
+      ? window.dmApi.endSession(failedSession.id, timerStart ? Math.round((Date.now() - timerStart) / 1000) : 0,
+          "error", title + (detail ? ": " + detail : ""))
+      : Promise.resolve();
+    cleanup.catch(function () {});
+
     var detailText = String(detail || "").trim().slice(0, 1600);
     openModal({
       title: "采集失败",
@@ -1300,15 +1308,20 @@ Date November 2026
             "<p class=\"fail__hint\">可以重试，或退出后检查主机配置。</p>",
       ok: "重试", cancel: "退出", danger: true
     }).then(function (yes) {
-      activeSession = null;
-      hideLive();
-      timerStart = 0;
-      if (!yes) { return; }
-       
-      if (retry.folder) {
-        setPhase("idle", "准备中");
-        startCaptureSession(retry.folder, retry.cfg || loadCfg() || CFG_DEFAULT);
-      }
+      return cleanup.then(function () {
+        activeSession = null;
+        hideLive();
+        timerStart = 0;
+        loadFolders();
+        if (!yes) { return; }
+
+        if (retry.folder) {
+          setPhase("idle", "准备中");
+          startCaptureSession(retry.folder, retry.cfg || loadCfg() || CFG_DEFAULT);
+        }
+      });
+    }).catch(function (e) {
+      toast("失败会话清理未完成，请重试结束会话：" + (e.message || e));
     });
   }
 

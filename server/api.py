@@ -48,7 +48,7 @@ TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(TOOL_DIR)
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 DEFAULT_DATA = os.environ.get("DM_DATA_DIR", os.path.join(PROJECT_DIR, "datasets"))
 _pos = [a for a in sys.argv[1:] if not a.startswith("-")]
 INIT_DATA = os.path.abspath(_pos[0]) if _pos else DEFAULT_DATA
@@ -1183,10 +1183,11 @@ def _session_start_locked(dir_path, folder, user):
     target = pre["abs_path"]
 
     upload_forget((agent_rel + "/" + os.path.basename(target)).strip("/"))
-    try:
-        os.makedirs(target, exist_ok=True)
-    except Exception as e:
-        raise ApiError(500, "创建目录失败: %s" % e)
+    if not agent_on():
+        try:
+            os.makedirs(target, exist_ok=True)
+        except Exception as e:
+            raise ApiError(500, "创建目录失败: %s" % e)
     if agent_on():
         try:
             archive_rel = (agent_rel + "/" + os.path.basename(target)).strip("/")
@@ -1293,6 +1294,25 @@ def op_session_end(sid, duration_s, state="done", error=None, user=None):
         db.audit(conn, user["account"] if user else None,
                  "session_end", row["dir_path"], "duration=%s" % int(duration_s or 0))
         owner = row["created_by"]
+
+    if agent_on():
+        try:
+            cleanup = _agent_call("/api/files/rmdir-empty",
+                                  {"dir": _agent_rel(row["dir_path"])}, timeout=10)
+        except (AgentDown, AgentError):
+            cleanup = {}
+    else:
+        cleanup = {}
+        target = resolve_dir(row["dir_path"])
+        if target and os.path.realpath(target) not in map(os.path.realpath, ALLOW_ROOTS):
+            try:
+                os.rmdir(target)
+                cleanup = {"empty": True}
+            except OSError:
+                pass
+    if cleanup.get("empty"):
+        return {"id": sid, "duration_s": int(duration_s or 0), "state": state,
+                "collector": None, "archive": None, "empty_removed": True}
 
 
     d = resolve_dir(row["dir_path"])
@@ -1404,21 +1424,19 @@ def op_records(dir_path, sync=False, session_id=None, remote=False):
     return {"dir": rel, "abs_dir": d, "records": items, "total": len(items)}
 
 def op_record_delete(dir_path, name, user=None, remote=False):
-    if remote and agent_on():
+    if remote:
+        if not agent_on():
+            raise err400("设备未连接，无法删除采集端数据")
         try:
             r = _agent_call("/api/files/rm", {"dir": _agent_rel(dir_path), "name": name},
                             timeout=20)
             rel = _agent_rel(dir_path)
-            db_rel = os.path.join(os.path.basename(INIT_DATA), rel) if rel else \
-                os.path.basename(INIT_DATA)
             with db.connect() as conn:
-                conn.execute("DELETE FROM records WHERE dir_path=? AND name=?",
-                             (db_rel, name))
                 db.audit(conn, user["account"] if user else None, "record_delete",
                          "agent:%s/%s" % (rel, name))
             return {"deleted": r.get("deleted") or name, "remote": True}
         except (AgentDown, AgentError):
-            pass
+            raise err400("采集端文件删除失败，服务端文件保持不变")
     d = resolve_dir(dir_path)
     if d is None:
         raise err400("目录不存在或不在允许范围")
@@ -1440,7 +1458,9 @@ def op_record_delete(dir_path, name, user=None, remote=False):
 
 def op_dir_delete(dir_path, user=None, remote=False):
 
-    if remote and agent_on():
+    if remote:
+        if not agent_on():
+            raise err400("设备未连接，无法删除采集端数据")
 
 
         rel = _agent_rel(dir_path)
@@ -1449,25 +1469,11 @@ def op_dir_delete(dir_path, user=None, remote=False):
         try:
             r = _agent_call("/api/files/rmdir", {"dir": rel}, timeout=30)
         except (AgentDown, AgentError):
-            if remote:
-                raise err400("设备已断开，无法删除设备上的目录")
-            raise
-        db_rel = os.path.join(os.path.basename(INIT_DATA), rel)
-
-        local = os.path.join(os.path.abspath(INIT_DATA), rel)
-        if (os.path.isdir(local) and not os.path.islink(local)
-                and os.path.abspath(local) != os.path.abspath(INIT_DATA)):
-            shutil.rmtree(local, ignore_errors=True)
+            raise err400("设备已断开，无法删除设备上的目录")
         with db.connect() as conn:
-            for tbl, col in (("records", "dir_path"), ("reviews", "dir_path"),
-                             ("segments", "dir_path"),
-                             ("review_seconds", "dir_path")):
-                conn.execute("DELETE FROM %s WHERE %s=?" % (tbl, col), (db_rel,))
-                conn.execute("DELETE FROM %s WHERE %s LIKE ?" % (tbl, col), (db_rel + "/%",))
             db.audit(conn, user["account"] if user else None, "dir_delete",
                      "agent:%s (%d files, %d bytes)" % (rel, r.get("files") or 0,
                                                         r.get("bytes") or 0))
-        upload_forget(rel)
         return {"deleted": rel, "files": r.get("files") or 0,
                 "bytes": r.get("bytes") or 0, "remote": True}
     d = resolve_dir(dir_path)

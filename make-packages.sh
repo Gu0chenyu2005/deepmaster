@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$ROOT/dist"
 SRC="${DM_PROGRAM_SOURCE:-$HOME/orin-progs}"
 TS="$(date +%Y%m%d_%H%M%S)"
+VERSION="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).read_text().strip())' "$ROOT/VERSION")"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$DIST"
@@ -80,7 +81,7 @@ for p in sorted(root.rglob('*'), reverse=True):
 PY
   chmod +x "$P/install.sh"
   check_package "$P"
-  local OUT="$DIST/orin-collect-$TS.tar.zst"
+  local OUT="$DIST/orin-collect-v$VERSION-$TS.tar.zst"
   tar -I 'zstd -3 -T0' -cf "$OUT" -C "$STAGE" dm-collect
   echo "$OUT"
 }
@@ -99,7 +100,7 @@ build_server() {
   find "$P" -type f -exec chmod 644 {} +
   chmod +x "$P/install.sh"
   check_package "$P"
-  local OUT="$DIST/server-review-$TS.tar.gz"
+  local OUT="$DIST/server-review-v$VERSION-$TS.tar.gz"
   tar -czf "$OUT" -C "$STAGE" dm-web
   echo "$OUT"
 }

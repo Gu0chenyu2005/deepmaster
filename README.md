@@ -1,5 +1,4 @@
-deepmaster
-
+<img width="1344" height="360" alt="deepmaster-logo" src="https://github.com/user-attachments/assets/1b172453-8831-46bb-859f-6acd114caee8" />
 足臂机器人数据采集与审核平台，采用服务端与采集端分离架构，支持设备管理、三相机实时预览、遥操作采集及数据审核。
 
 - `server/`：服务端与采集端代理代码

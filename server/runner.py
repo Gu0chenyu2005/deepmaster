@@ -496,7 +496,79 @@ def run_t1(cfg):
     return {"ok": True, "remote": True, "host": _clean(cfg.get("dds_ip")),
             "already_running": "already running" in result["out"], "waited_s": 5}
 
+_SETHOME_CONTROL = r'''
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+def group_alive(pgid):
+    for entry in Path('/proc').glob('[0-9]*/stat'):
+        try:
+            fields = entry.read_text().rsplit(')', 1)[1].split()
+            if int(fields[2]) == pgid and fields[0] not in ('Z', 'X'):
+                return True
+        except (OSError, ValueError, IndexError):
+            continue
+    return False
+
+def stop_group(proc):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            proc.poll()
+            if not group_alive(proc.pid):
+                proc.wait(timeout=1)
+                return
+            time.sleep(0.05)
+    raise RuntimeError('SetHome process group could not be stopped')
+
+def interrupted(signum, frame):
+    raise RuntimeError('SetHome controller interrupted: %s' % signum)
+
+for sig in (signal.SIGTERM, signal.SIGHUP):
+    signal.signal(sig, interrupted)
+
+proc = None
+error = None
+with tempfile.TemporaryFile() as output:
+    try:
+        proc = subprocess.Popen([sys.argv[1], '-1'], stdin=subprocess.DEVNULL,
+                                stdout=output, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+        try:
+            code = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            raise RuntimeError('SetHome exited before five seconds (code %s)' % code)
+    except Exception as exc:
+        error = str(exc)
+    finally:
+        if proc is not None:
+            try:
+                stop_group(proc)
+            except Exception as exc:
+                error = str(exc)
+        output.seek(0, 2)
+        output.seek(max(0, output.tell() - 4096))
+        if error:
+            print(output.read().decode('utf-8', 'replace'))
+            print(error)
+            sys.exit(1)
+print('deepmaster-sethome: completed five-second run; process group stopped')
+'''
+
+
 def run_tare(cfg):
+    """执行五秒标零，并回收本次启动的远端进程组。"""
 
     if _dry(cfg):
         return {"ok": True, "dry_run": True}
@@ -509,10 +581,10 @@ def run_tare(cfg):
         "set -eu",
         "cd %s" % shlex.quote(k7_dir),
         "export LD_LIBRARY_PATH=%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" % shlex.quote(k7_lib),
-        "timeout -s KILL 2 %s -1" % shlex.quote("./" + sethome),
+        "python3 -c %s %s" % (shlex.quote(_SETHOME_CONTROL), shlex.quote("./" + sethome)),
     ])
-    result = _dds_run(cfg, script, timeout=10)
-    if result["code"] not in (0, 124, 137):
+    result = _dds_run(cfg, script, timeout=15)
+    if result["code"] != 0 or "deepmaster-sethome: completed five-second run; process group stopped" not in result["out"]:
         return {"ok": False, "error": "DDS 上 SetHome 执行失败：%s" % result["out"][-2000:]}
     return {"ok": True, "remote": True, "host": _clean(cfg.get("dds_ip"))}
 

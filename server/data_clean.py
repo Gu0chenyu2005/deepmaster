@@ -38,7 +38,8 @@ def _decode_gray(ds, lengths, frame):
         raise ValueError("invalid JPEG frame length")
     with Image.open(io.BytesIO(row[:length].tobytes())) as image:
         image.load()
-        return np.asarray(image.convert("L").resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.BILINEAR),
+        resampling = getattr(Image, "Resampling", Image).BILINEAR
+        return np.asarray(image.convert("L").resize((IMAGE_SIZE, IMAGE_SIZE), resampling),
                           dtype=np.float32)
 
 

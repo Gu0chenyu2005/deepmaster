@@ -13,7 +13,7 @@
 
 网页地址：`http://服务器IP:8790`。连接在线设备后，在“程序配置”中填写 DDS 主机信息。
 
-Version:1.1.1
+Version:1.2.0
 <img width="1922" height="1118" alt="截图 2026-11-11 11-45-19" src="https://github.com/user-attachments/assets/1dca229a-b52f-420f-acc8-f608d38ea89e" />
 <img width="1922" height="1118" alt="截图 2026-11-11 11-45-39" src="https://github.com/user-attachments/assets/c2dab4a9-5c27-4652-bf22-c9e0bad6d8e8" />
 <img width="1912" height="1117" alt="截图 2026-11-11 14-13-30" src="https://github.com/user-attachments/assets/eb5823ce-2749-4405-8fcc-b79c310eec2e" />

@@ -305,17 +305,11 @@ def find_companion_length(name, all_datasets):
     return None
 
 
-def _luminance_thresholds(dtype):
-    """返回 (黑屏, 过曝) 均值阈值。"""
+def _overexposure_threshold(dtype):
+    """返回过曝均值阈值。"""
     if np.issubdtype(dtype, np.floating):
-        return 0.02, 0.98
-    return 2.0, 253.0
-
-
-def _luminance_flags(mean_value, dtype):
-    """判定单帧是否黑屏或过曝。"""
-    low, high = _luminance_thresholds(dtype)
-    return mean_value < low, mean_value > high
+        return 0.98
+    return 253.0
 
 
 def _iter_dataset_chunks(ds, max_elements=MAX_ARRAY_CHUNK_ELEMENTS):
@@ -485,18 +479,12 @@ def check_timestamps(ds, rules, name=""):
     return issues
 
 
-def _append_stream_quality_issues(name, issues, max_black, max_white, max_freeze, rules):
-    """汇总黑屏、过曝与画面冻结异常。"""
-    black_run_limit = rules.get("black_run_limit", 15)
+def _append_stream_quality_issues(name, issues, max_white, rules):
+    """汇总图像过曝异常。"""
     white_run_limit = rules.get("white_run_limit", 15)
-    freeze_run_limit = rules.get("freeze_run_limit", 15)
 
-    if max_black >= black_run_limit:
-        issues.append(("FAIL", "图像严重黑屏: %s (连续 %d 帧)" % (name, max_black)))
     if max_white >= white_run_limit:
         issues.append(("FAIL", "图像严重过曝: %s (连续 %d 帧)" % (name, max_white)))
-    if max_freeze >= freeze_run_limit:
-        issues.append(("FAIL", "图像画面冻结: %s (连续 %d 帧)" % (name, max_freeze)))
 
 
 def _resize_gray_to_grid(gray, grid_size=OCCLUSION_GRID_SIZE):
@@ -778,7 +766,7 @@ def check_rgbd_cable_occlusion(datasets, rules):
 
 
 def _check_compressed_stream(name, ds, len_ds, issues, rules):
-    """校验压缩图像流（空帧、损坏、黑屏、过曝、冻结与常驻暗区遮挡）。"""
+    """校验压缩图像流（空帧、损坏、过曝与常驻暗区遮挡）。"""
     n = ds.shape[0]
     lens = None
     if len_ds is not None:
@@ -797,12 +785,8 @@ def _check_compressed_stream(name, ds, len_ds, issues, rules):
         if positive.size and np.median(positive) >= 2 * min_jpeg_bytes:
             short_frame_limit = min_jpeg_bytes
 
-    black_flags = np.zeros(n, dtype=bool)
     white_flags = np.zeros(n, dtype=bool)
-    same_flags = np.zeros(max(0, n - 1), dtype=bool)
     empty_frames, corrupt_frames = [], []
-    decoded_count = 0
-    prev_gray = None
 
     sample_set = set(np.linspace(0, n - 1, min(n, OCCLUSION_SAMPLE_FRAMES), dtype=int).tolist()) if n >= 10 else set()
     occ_grids = []
@@ -811,16 +795,13 @@ def _check_compressed_stream(name, ds, len_ds, issues, rules):
         if lens is not None:
             if i >= lens.size:
                 empty_frames.append(i)
-                prev_gray = None
                 continue
             value = lens[i]
             if not np.isfinite(value) or value <= 0 or value < short_frame_limit:
                 empty_frames.append(i)
-                prev_gray = None
                 continue
             if value != int(value) or (ds.ndim == 2 and value > ds.shape[1]):
                 corrupt_frames.append(i)
-                prev_gray = None
                 continue
             length = int(value)
         else:
@@ -838,21 +819,14 @@ def _check_compressed_stream(name, ds, len_ds, issues, rules):
                 gray = np.asarray(img.convert("L"), dtype=np.uint8)
         except (OSError, ValueError, TypeError):
             corrupt_frames.append(i)
-            prev_gray = None
             continue
 
-        decoded_count += 1
         mean_value = float(np.mean(gray, dtype=np.float64))
-        is_black, is_white = _luminance_flags(mean_value, np.uint8)
-        black_flags[i] = is_black
-        white_flags[i] = is_white
+        white_flags[i] = mean_value > _overexposure_threshold(np.uint8)
 
         if i in sample_set and min(gray.shape[:2]) >= 32:
             occ_grids.append(_resize_gray_to_grid(gray))
 
-        if i > 0 and prev_gray is not None and gray.shape == prev_gray.shape and np.array_equal(gray, prev_gray):
-            same_flags[i - 1] = True
-        prev_gray = gray
 
     max_empty_frames = int(rules.get("max_empty_frames", 0))
     allow_first_empty = bool(rules.get("allow_first_empty_frame", True))
@@ -866,16 +840,14 @@ def _check_compressed_stream(name, ds, len_ds, issues, rules):
         issues.append(("FAIL", "图像解码失败或长度异常: %s 共 %d 帧 (如 %s)" %
                        (name, len(corrupt_frames), corrupt_frames[:10])))
 
-    max_black = count_max_run(black_flags)
     max_white = count_max_run(white_flags)
-    max_freeze = (count_max_run(same_flags) + 1) if np.any(same_flags) else (1 if decoded_count > 0 else 0)
-    _append_stream_quality_issues(name, issues, max_black, max_white, max_freeze, rules)
+    _append_stream_quality_issues(name, issues, max_white, rules)
     _check_rgb_static_occlusion(name, occ_grids, issues, rules)
     return issues
 
 
 def _check_pixel_stream(name, ds, issues, rules):
-    """分块校验原始像素流（黑屏、过曝、冻结与常驻暗区遮挡）。"""
+    """分块校验原始像素流（过曝与常驻暗区遮挡）。"""
     if not looks_like_image_shape(ds.shape):
         return issues
 
@@ -887,13 +859,10 @@ def _check_pixel_stream(name, ds, issues, rules):
     if total == 0 or ds.size == 0:
         return issues
 
-    low_thresh, high_thresh = _luminance_thresholds(ds.dtype)
+    high_thresh = _overexposure_threshold(ds.dtype)
     chunk_frames = max(1, int(rules.get("chunk_frames", DEFAULT_PIXEL_CHUNK_FRAMES)))
 
-    black_chunks = []
     white_chunks = []
-    same_chunks = []
-    prev_last_frame = None
     sample_set = set(np.linspace(0, total - 1, min(total, OCCLUSION_SAMPLE_FRAMES), dtype=int).tolist()) if total >= 10 else set()
     occ_grids = []
 
@@ -906,21 +875,7 @@ def _check_pixel_stream(name, ds, issues, rules):
 
             axes = tuple(range(1, chunk.ndim))
             means = np.mean(chunk, axis=axes, dtype=np.float64) if axes else chunk.astype(np.float64)
-            black_chunks.append(means < low_thresh)
             white_chunks.append(means > high_thresh)
-
-            if prev_last_frame is not None:
-                boundary_same = bool(
-                    chunk[0].shape == prev_last_frame.shape and np.array_equal(chunk[0], prev_last_frame)
-                )
-                same_chunks.append(np.array([boundary_same], dtype=bool))
-
-            if chunk.shape[0] > 1:
-                if axes:
-                    intra_same = np.all(chunk[1:] == chunk[:-1], axis=axes)
-                else:
-                    intra_same = chunk[1:] == chunk[:-1]
-                same_chunks.append(intra_same)
 
             for offset in range(chunk.shape[0]):
                 frame_idx = start + offset
@@ -933,19 +888,14 @@ def _check_pixel_stream(name, ds, issues, rules):
                     gray_u8 = np.clip(np.nan_to_num(frame, nan=0.0), 0.0, 255.0).astype(np.uint8)
                     occ_grids.append(_resize_gray_to_grid(gray_u8))
 
-            prev_last_frame = chunk[-1]
     except (ValueError, TypeError):
         return issues
 
-    black_mask = np.concatenate(black_chunks) if black_chunks else np.zeros(0, dtype=bool)
     white_mask = np.concatenate(white_chunks) if white_chunks else np.zeros(0, dtype=bool)
-    same_mask = np.concatenate(same_chunks) if same_chunks else np.zeros(0, dtype=bool)
 
-    max_black = count_max_run(black_mask)
     max_white = count_max_run(white_mask)
-    max_freeze = (count_max_run(same_mask) + 1) if np.any(same_mask) else 1
 
-    _append_stream_quality_issues(name, issues, max_black, max_white, max_freeze, rules)
+    _append_stream_quality_issues(name, issues, max_white, rules)
     _check_rgb_static_occlusion(name, occ_grids, issues, rules)
     return issues
 
@@ -2177,9 +2127,7 @@ def main():
     rules = {
         "min_frames": args.min_frames,
         "max_gap_ms": args.max_gap_ms,
-        "black_run_limit": 15,
         "white_run_limit": 15,
-        "freeze_run_limit": 15,
         "check_action_consistency": not args.no_action_consistency,
         "check_scene_redundancy": not args.no_scene_check,
         "check_occlusion": not args.no_occlusion_check,

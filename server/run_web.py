@@ -36,7 +36,8 @@ class H(BaseHTTPRequestHandler):
         import http.client
         try:
             conn = http.client.HTTPConnection(API_HOST, API_PORT, timeout=30)
-            conn.request("GET", self.path)
+            headers = {"Authorization": self.headers["Authorization"]} if self.headers.get("Authorization") else {}
+            conn.request("GET", self.path, headers=headers)
             r = conn.getresponse()
         except Exception as e:      # noqa: BLE001
             msg = ('{"code":502,"message":"%s"}' % e).encode()
@@ -48,8 +49,11 @@ class H(BaseHTTPRequestHandler):
             return
 
         self.send_response(r.status)
-        ctype = r.getheader("Content-Type") or "multipart/x-mixed-replace; boundary=frame"
+        ctype = r.getheader("Content-Type") or "application/octet-stream"
         self.send_header("Content-Type", ctype)
+        for name in ("Content-Length", "Content-Disposition"):
+            if r.getheader(name):
+                self.send_header(name, r.getheader(name))
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("X-Accel-Buffering", "no")
         self.send_header("Connection", "close")
@@ -121,7 +125,8 @@ class H(BaseHTTPRequestHandler):
     def _static(self):
         path = self.path.split("?")[0].lstrip("/") or "index.html"
         f = os.path.join(ROOT, path)
-        if not os.path.isfile(f) or ".." in path:
+        if (not os.path.isfile(f) or ".." in path
+                or not (path == "index.html" or path.startswith("assets/"))):
             self.send_response(404); self.send_header("Content-Length","0"); self.end_headers(); return
         data = open(f,"rb").read()
         ext = os.path.splitext(f)[1]
@@ -144,7 +149,8 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path.startswith("/api/cam/stream/"):
+        if (self.path.startswith("/api/cam/stream/")
+                or self.path.startswith("/api/lerobot-export/download?")):
             return self._stream_proxy()
         if self.path.startswith("/api/"): return self._proxy("GET")
         return self._static()

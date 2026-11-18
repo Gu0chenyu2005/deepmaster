@@ -30,6 +30,8 @@ import db
 import runner
 import geo
 import system
+import lerobot_export
+import data_clean
 
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -48,7 +50,7 @@ TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(TOOL_DIR)
 
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.2.0"
 DEFAULT_DATA = os.environ.get("DM_DATA_DIR", os.path.join(PROJECT_DIR, "datasets"))
 _pos = [a for a in sys.argv[1:] if not a.startswith("-")]
 INIT_DATA = os.path.abspath(_pos[0]) if _pos else DEFAULT_DATA
@@ -518,6 +520,16 @@ def _pull_archive(rel, account=None, on_progress=None, on_state=None):
                 files += 1
                 total += member.size or 0
 
+        cleaning = data_clean.clean_directory(tree)
+        with open(os.path.join(tree, "deepmaster_cleaning_report.json"), "w", encoding="utf-8") as report:
+            json.dump({"method": "first_black_and_internal_stall",
+                       "stall_thresholds": {"min_frames": data_clean.MIN_STALL_FRAMES,
+                                             "qpos_step": data_clean.QPOS_STEP_THRESHOLD,
+                                             "qpos_range": data_clean.QPOS_RANGE_THRESHOLD,
+                                             "image_mad": data_clean.IMAGE_MAD_THRESHOLD},
+                       "episodes": cleaning}, report, ensure_ascii=False, indent=2)
+            report.write("\n")
+
         os.makedirs(target, exist_ok=True)
         for base, dirs, names in os.walk(tree):
             relbase = os.path.relpath(base, tree)
@@ -535,7 +547,7 @@ def _pull_archive(rel, account=None, on_progress=None, on_state=None):
     with db.connect() as conn:
         db.audit(conn, account, "pull", rel, None if files else "空目录")
     return {"dir": rel, "files": files, "bytes": total, "archive_bytes": received,
-            "dest": target}
+            "cleaned_episodes": cleaning, "dest": target}
 
 
 def op_pull(body, user=None):
@@ -2338,6 +2350,43 @@ def op_stats(user=None):
     }
 
 
+_EXPORT_MANAGER = None
+_EXPORT_MANAGER_LOCK = threading.Lock()
+
+
+def export_manager():
+    global _EXPORT_MANAGER
+    with _EXPORT_MANAGER_LOCK:
+        if _EXPORT_MANAGER is None:
+            root = os.environ.get("DM_EXPORT_DIR") or os.path.join(PROJECT_DIR, "exports")
+            _EXPORT_MANAGER = lerobot_export.ExportManager(root)
+    return _EXPORT_MANAGER
+
+
+def op_lerobot_export(dir_path, user):
+    d = resolve_dir(dir_path)
+    if not d or not os.path.isdir(d):
+        raise err400("数据目录不存在")
+    rel = rel_to_data(d)
+    labels, _ = _read_review_state(rel)
+    files = [(ep, p) for ep, p in list_episode_files(d)
+             if ep in labels and labels[ep]["status"] == "good"]
+    root = os.path.realpath(d) + os.sep
+    if any(not os.path.realpath(p).startswith(root) for _, p in files):
+        raise err400("源文件不在数据目录内")
+    schemas = {}
+    for ep, path in files:
+        with h5py.File(path, "r") as h5:
+            schemas[ep] = detect_schema(h5)
+    try:
+        job = export_manager().start(rel, files, os.path.basename(d), schemas)
+    except ValueError as e:
+        raise err400(str(e))
+    with db.connect() as conn:
+        db.audit(conn, user["account"], "lerobot_export", rel, job["id"])
+    return job
+
+
 def _has_table(conn, name):
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
@@ -2416,9 +2465,7 @@ def refresh_snapshot(d, rel=None):
 QC_RULES = {
     "min_frames": 10,
     "max_gap_ms": 1000.0,
-    "black_run_limit": 15,
     "white_run_limit": 15,
-    "freeze_run_limit": 15,
     "check_occlusion": True,
     "check_scene_redundancy": True,
     "check_action_consistency": True,
@@ -2787,6 +2834,47 @@ class Handler(BaseHTTPRequestHandler):
     def _route_get(self, rest, q):
         head = rest[0] if rest else ""
 
+        if head == "lerobot-export":
+            manager = export_manager()
+            action = rest[1] if len(rest) > 1 else ""
+            if action == "download":
+                job_id = (q.get("id") or [""])[0]
+                ticket = (q.get("ticket") or [""])[0]
+                if not lerobot_export.check_ticket(job_id, ticket, auth._secret()):
+                    self._user(required=True)
+                job = manager.get(job_id)
+                if job["state"] != "done":
+                    raise err400("导出尚未完成")
+                path = manager.root / job_id / "dataset.tar.gz"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/gzip")
+                self.send_header("Content-Length", str(path.stat().st_size))
+                self.send_header("Content-Disposition", 'attachment; filename="lerobot-%s.tar.gz"' % job_id[:8])
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                try:
+                    with path.open("rb") as stream:
+                        shutil.copyfileobj(stream, self.wfile, 1024 * 1024)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            self._user(required=True)
+            try:
+                job_id = (q.get("id") or [""])[0]
+                if job_id:
+                    job = manager.get(job_id)
+                else:
+                    directory = resolve_dir((q.get("dir") or [""])[0])
+                    if not directory:
+                        raise err400("数据目录不存在")
+                    job = manager.latest(rel_to_data(directory))
+            except ValueError as e:
+                raise err400(str(e))
+            if job and job["state"] == "done":
+                ticket = lerobot_export.download_ticket(job["id"], auth._secret())
+                job["download_url"] = "/api/lerobot-export/download?id=%s&ticket=%s" % (job["id"], ticket)
+            return self._ok(job)
+
         if head == "health":
             return self._ok({"ok": True, "time": db.now(), "version": APP_VERSION})
 
@@ -2961,6 +3049,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
         user = self._user(required=True, min_role="user")
+        if head == "lerobot-export":
+            return self._ok(op_lerobot_export(self._body().get("dir") or "", user))
         if head == "pull":
             return self._ok(op_pull(self._body(), user))
 

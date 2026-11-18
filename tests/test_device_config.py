@@ -93,7 +93,8 @@ class DeviceConfigTests(unittest.TestCase):
                'dds_password': 'secret', 'k7_dir': '/home/user',
                'k7_lib_path': '/home/user', 'k7_bin': 'K7Master3',
                'k7_sethome_bin': 'SetHome', 'k7_chrt': '90', 'k7_taskset': '6,7'}
-        with patch.object(agent.runner, '_dds_run', return_value={'code': 0, 'out': 'started'}) as run:
+        with patch.object(agent.runner, '_dds_run', return_value={
+                'code': 0, 'out': 'deepmaster-sethome: completed five-second run; process group stopped'}) as run:
             started = agent.runner.run_t1(cfg)
             stopped = agent.runner.run_tare(cfg)
         self.assertTrue(started['ok'])
@@ -113,7 +114,8 @@ class DeviceConfigTests(unittest.TestCase):
                                 text=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
-        self.assertIn('SetHome -1', run.call_args_list[1].args[1])
+        self.assertIn('./SetHome', run.call_args_list[1].args[1])
+        self.assertIn("[sys.argv[1],", run.call_args_list[1].args[1])
 
     def test_deploy_always_uses_standard_build_directory(self):
         path = agent.runner._rl_deploy_work({

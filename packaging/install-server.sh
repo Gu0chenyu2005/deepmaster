@@ -13,6 +13,20 @@ if ! python3 -c 'import h5py, numpy, requests' 2>/dev/null; then
   apt-get update
   apt-get install -y python3 python3-h5py python3-numpy python3-requests
 fi
+if ! command -v ffmpeg >/dev/null || ! python3 -c 'import PIL' 2>/dev/null; then
+  apt-get update
+  apt-get install -y ffmpeg python3-pil
+fi
+if ! /usr/bin/python3 -c 'import pyarrow, pandas' 2>/dev/null; then
+  apt-get update
+  apt-get install -y python3-venv
+  /usr/bin/python3 -m venv "$ROOT/.export-venv"
+  "$ROOT/.export-venv/bin/python" -m pip install 'numpy>=1.23,<2' 'h5py>=3.8,<4' pillow 'pyarrow>=17,<26' 'pandas>=2,<3'
+fi
+EXPORT_PYTHON=/usr/bin/python3
+if [ -x "$ROOT/.export-venv/bin/python" ]; then
+  EXPORT_PYTHON="$ROOT/.export-venv/bin/python"
+fi
 python3 - "$PORT" "$API_PORT" <<'PY'
 import sys
 ports = [int(value) for value in sys.argv[1:]]
@@ -68,6 +82,7 @@ Environment=$(unit_quote "DM_DATA_DIR=$DATA_DIR")
 Environment=$(unit_quote "DM_ADMIN_PASSWORD=${DM_ADMIN_PASSWORD:-admin123}")
 Environment=$(unit_quote "DM_AGENT_URL=${DM_AGENT_URL:-}")
 Environment="API_PORT=$API_PORT"
+Environment=$(unit_quote "DM_EXPORT_PYTHON=$EXPORT_PYTHON")
 Environment=PYTHONDONTWRITEBYTECODE=1
 Restart=on-failure
 RestartSec=3

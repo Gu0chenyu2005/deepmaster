@@ -90,7 +90,7 @@ build_server() {
   local P="$STAGE/dm-web"
   mkdir -p "$P/server"
   cp -a "$ROOT/index.html" "$ROOT/assets" "$P/"
-  for name in api run_web auth db runner system cam geo auto_qc; do
+  for name in api run_web auth db runner system cam geo auto_qc lerobot_export data_clean; do
     cp -a "$ROOT/server/$name.py" "$P/server/"
   done
   cp -a "$ROOT/packaging/host_config.server.json" "$P/host_config.json"

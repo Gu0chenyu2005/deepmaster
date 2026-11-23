@@ -4,6 +4,7 @@
 """本机采集程序执行器，供采集端代理及服务器本地模式调用。"""
 
 import os
+from functools import wraps
 import fcntl
 import pty
 import re
@@ -25,6 +26,21 @@ K7_READY_TIMEOUT = float(os.environ.get("DM_K7_READY_TIMEOUT", "30"))
 RL_GRACE = float(os.environ.get("DM_RL_GRACE", "5"))
 _lock = threading.Lock()
 _procs = {}
+_operation_lock = threading.RLock()
+
+
+def serialized_operation(func):
+    """拒绝并发控制操作，同线程嵌套调用共用锁。"""
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        if not _operation_lock.acquire(blocking=False):
+            return {"ok": False, "error": "设备正在执行其他控制操作，请等待完成"}
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _operation_lock.release()
+    return wrapped
+
 
 
 K7_KEY = "k7master3"
@@ -93,9 +109,12 @@ def _expand(path):
     return os.path.expanduser(os.path.expandvars(path))
 
 
-def spawn(key, name, cmd, cwd=None, want_stdin=False):
+@serialized_operation
+def spawn(key, name, cmd, cwd=None, want_stdin=False, env=None):
     """替换同名进程；want_stdin 指定是否保留交互输入管道。"""
-    stop(key)
+    stopped = stop(key)
+    if not stopped.get("ok"):
+        return stopped
 
     log_offset = _log_size(key)
 
@@ -127,6 +146,7 @@ def spawn(key, name, cmd, cwd=None, want_stdin=False):
             stdout = log
         proc = subprocess.Popen(
             cmd, shell=is_shell, cwd=cwd,
+            env=({**os.environ, **env} if env is not None else None),
             stdin=stdin, stdout=stdout,
             stderr=(slave_fd if want_stdin else subprocess.STDOUT),
             start_new_session=not want_stdin,
@@ -202,6 +222,13 @@ def _alive(key):
     return ent["proc"].poll() is None
 
 
+def _managed_control_only():
+    with _lock:
+        ent = _procs.get(RL_KEY)
+    return bool(ent and ent["proc"].poll() is None and
+                "ARMDOG_CONTROL_ONLY=1" in str(ent.get("cmd", "")))
+
+
 def wait_for_pattern(key, pattern, offset=0, timeout=30.0, settle=0.6):
     """日志匹配后确认进程持续存活，返回就绪状态与等待时长。"""
     t0 = time.time()
@@ -250,6 +277,7 @@ def send_key(key, ch):
         return {"ok": False, "error": "写入失败：%s" % e}
 
 
+@serialized_operation
 def stop(key):
     """按进程组终止，先 TERM 后 KILL。"""
     with _lock:
@@ -276,6 +304,8 @@ def stop(key):
         except Exception:
             pass
         time.sleep(0.2)
+    if proc.poll() is None:
+        return {"ok": False, "error": "进程未退出，保留管理状态以便重试"}
     _close_process_input(ent)
     with _lock:
         _procs.pop(key, None)
@@ -432,6 +462,7 @@ def _dds_run(cfg, script, timeout=30):
         return {"code": -1, "out": str(e)}
 
 
+@serialized_operation
 def run_t1(cfg):
     """按需启动 K7Master3，并等待返回值 236 稳定五秒。"""
     if _dry(cfg):
@@ -567,6 +598,7 @@ print('deepmaster-sethome: completed five-second run; process group stopped')
 '''
 
 
+@serialized_operation
 def run_tare(cfg):
     """执行五秒标零，并回收本次启动的远端进程组。"""
 
@@ -588,29 +620,51 @@ def run_tare(cfg):
         return {"ok": False, "error": "DDS 上 SetHome 执行失败：%s" % result["out"][-2000:]}
     return {"ok": True, "remote": True, "host": _clean(cfg.get("dds_ip"))}
 
-def run_t2(cfg):
+@serialized_operation
+def run_t2(cfg, control_only=False):
     """启动 手柄服务 + rl_deploy。"""
     if _dry(cfg):
         return {"ok": True, "dry_run": True, "pid": None}
     bin_name = _clean(cfg.get("rl_deploy_bin"), "rl_deploy")
     if _alive(RL_KEY):
+        if control_only and _managed_control_only():
+            return {"ok": True, "already": True, "control_only": True}
+        if _managed_control_only():
+            return {"ok": False,
+                    "error": "远控已退出，控制程序仍在阻尼保持机械臂；请在机械臂得到支撑并确认安全后处理该进程"}
         return {"ok": False, "error": "采集程序已经运行，请先结束当前采集"}
     if pgrep_count([bin_name]):
         return {"ok": False, "error": "检测到其他位置的采集程序正在运行，请先停止该程序"}
+    if control_only:
+        scheduling = _validate_control_scheduling()
+        if not scheduling["ok"]:
+            return scheduling
     pw = _sudo(cfg.get("sudo_pw"))
 
     svc_dir = _clean(cfg.get("robot_service_dir"))
     svc_script = _clean(cfg.get("robot_service_script"))
+    deploy_dir = _clean(cfg.get("rl_deploy_dir"))
+    if control_only:
+        package_root = os.path.realpath(PROJECT_DIR)
+        for label, path in (("手柄服务", svc_dir), ("rl_deploy", deploy_dir)):
+            real = os.path.realpath(_expand(path)) if path else ""
+            if not real or (real != package_root and not real.startswith(package_root + os.sep)):
+                return {"ok": False, "error": "远控仅控制的%s必须来自采集端部署包" % label}
 
-    if svc_dir and svc_script and not _service_process_exists(svc_script):
-        svc_cmd = "cd %s && %s./%s" % (
-            shlex.quote(svc_dir), pw, shlex.quote(svc_script))
+    service_running = _service_process_exists(svc_script) if svc_dir and svc_script else False
+    if control_only and service_running:
+        scheduling = _pin_control_service(svc_dir)
+        if not scheduling["ok"]:
+            return scheduling
+    if svc_dir and svc_script and not service_running:
+        priority = "taskset -c 8-11 nice -n -10 " if control_only else ""
+        svc_cmd = "cd %s && %s%s./%s" % (
+            shlex.quote(svc_dir), pw, priority, shlex.quote(svc_script))
         r = spawn(SVC_KEY, "手柄服务", svc_cmd, cwd=svc_dir)
         if not r.get("ok"):
             return r
 
 
-    deploy_dir = _clean(cfg.get("rl_deploy_dir"))
     ros = _clean(cfg.get("ros_setup"))
     data_root = _data_root(cfg)
     fps = _clean(cfg.get("record_fps"))
@@ -626,16 +680,75 @@ def run_t2(cfg):
         parts.append("export ARMDOG_RECORD_FPS=%s" % shlex.quote(fps))
     if imu:
         parts.append("export ARMDOG_IMU_TOPIC=%s" % shlex.quote(imu))
-    parts.append("exec ./%s" % shlex.quote(bin_name))
+    if control_only:
+        parts.extend([
+            "export ARMDOG_CONTROL_ONLY=1",
+            "export ARMDOG_CAMERA_DISABLE=1",
+            "export ARMDOG_SHARED_FRAME_ENABLE=0",
+            "exec taskset -c 8-11 nice -n -10 ./%s" % shlex.quote(bin_name),
+        ])
+    else:
+        parts.append("exec ./%s" % shlex.quote(bin_name))
 
     cmd = "; ".join(parts)
     return spawn(RL_KEY, "rl_deploy", cmd, cwd=work, want_stdin=True)
+
+
+def _validate_control_scheduling():
+    """Verify the privileged agent can apply the fixed control CPU set and nice level."""
+    if not hasattr(os, "sched_getaffinity"):
+        return {"ok": False, "error": "当前系统不支持 CPU 亲和性调度"}
+    try:
+        available = set(os.sched_getaffinity(0))
+    except OSError as exc:
+        return {"ok": False, "error": "读取可用 CPU 失败：%s" % exc}
+    required = set(range(4, 12))
+    if not required.issubset(available):
+        return {"ok": False, "error": "远控仅控制调度需要 CPU 4–11，可用 CPU：%s" %
+                ",".join(map(str, sorted(available)))}
+    if os.geteuid() != 0:
+        return {"ok": False, "error": "远控仅控制调度需要采集端代理以 root 权限运行"}
+    return {"ok": True}
 
 
 def _service_process_exists(script="runService.sh"):
     """检测已由 systemd 或旧代理启动的手柄服务，避免重复占用 SDK 端口。"""
     names = {os.path.basename(script), "RoboticsServiceProcess"}
     return bool(find_pids(names))
+
+
+def _pin_control_service(service_dir):
+    """只调整部署包内已运行的手柄程序及其线程。"""
+    root = os.path.realpath(_expand(service_dir))
+    pids = find_pids(["RoboticsServiceProcess"])
+    managed = []
+    for pid in pids:
+        try:
+            executable = os.path.realpath("/proc/%d/exe" % pid)
+            if os.path.commonpath((root, executable)) != root:
+                return {"ok": False,
+                        "error": "检测到部署包外运行的 RoboticsServiceProcess，未修改其调度；请先通过原启动端停止它"}
+            managed.append(pid)
+        except (OSError, ValueError):
+            continue
+    if not managed:
+        return {"ok": False, "error": "手柄服务已存在但无法确认其来自采集端部署包"}
+
+    cpus = set(range(8, 12))
+    try:
+        for pid in managed:
+            task_dir = "/proc/%d/task" % pid
+            tids = [int(tid) for tid in os.listdir(task_dir)]
+            if not tids:
+                tids = [pid]
+            for tid in tids:
+                os.sched_setaffinity(tid, cpus)
+                os.setpriority(os.PRIO_PROCESS, tid, -10)
+                if os.sched_getaffinity(tid) != cpus or os.getpriority(os.PRIO_PROCESS, tid) != -10:
+                    raise OSError("调度参数校验失败（TID %d）" % tid)
+    except (OSError, ProcessLookupError) as exc:
+        return {"ok": False, "error": "无法设置已运行手柄服务的 CPU 亲和性或 nice -10：%s" % exc}
+    return {"ok": True}
 
 def kill_by_name(name, grace=1.5):
     """按文件名匹配进程并终止其进程组。"""
@@ -681,6 +794,7 @@ def kill_by_name(name, grace=1.5):
     return killed
 
 
+@serialized_operation
 def inject_z(cfg):
     """向 rl_deploy 发送 z，启动机械臂。"""
     if _dry(cfg):
@@ -688,6 +802,7 @@ def inject_z(cfg):
     return send_key(RL_KEY, "z")
 
 
+@serialized_operation
 def start_service(cfg):
     """单独启动手柄服务（runService）。"""
     if _dry(cfg):
@@ -706,6 +821,7 @@ def start_service(cfg):
     cmd = "cd %s && %s./%s" % (shlex.quote(svc_dir), pw, shlex.quote(svc_script))
     return spawn(SVC_KEY, "runService", cmd, cwd=svc_dir)
 
+@serialized_operation
 def stop_service(cfg):
     """停止手柄服务。"""
     if _dry(cfg):
@@ -713,6 +829,7 @@ def stop_service(cfg):
     return stop(SVC_KEY)
 
 
+@serialized_operation
 def start_deploy(cfg):
     """单独启动 rl_deploy（注入环境变量，保留 stdin 用于后续 z / d）。"""
     if _dry(cfg):
@@ -750,6 +867,7 @@ def start_deploy(cfg):
     cmd = "; ".join(parts)
     return spawn(RL_KEY, "rl_deploy", cmd, cwd=work, want_stdin=True)
 
+@serialized_operation
 def stop_deploy(cfg):
     """停止 rl_deploy（不经 stdio 握手，直接按进程组清理）。"""
     if _dry(cfg):
@@ -757,6 +875,7 @@ def stop_deploy(cfg):
     return stop(RL_KEY)
 
 
+@serialized_operation
 def stop_capture(cfg=None):
     """结束当前录制并停止采集进程，保留 K7 与手柄服务的保持状态。"""
     cfg = cfg or {}
@@ -781,6 +900,18 @@ def stop_capture(cfg=None):
                                     {"step": "keep_robotservice", "ok": True}]}
 
 
+@serialized_operation
+def stop_control_only(cfg=None):
+    """按近控停止顺序退出仅控制模式。"""
+    cfg = cfg or {}
+    if not _alive(RL_KEY):
+        if pgrep_count([_clean(cfg.get("rl_deploy_bin"), "rl_deploy")]):
+            return {"ok": False, "error": "采集程序由其他进程或旧代理管理，无法确认已退出，请通过原启动端处理"}
+        return {"ok": True, "already": True, "steps": []}
+    return stop_capture(cfg)
+
+
+@serialized_operation
 def stop_k7_force(cfg):
     if _dry(cfg):
         return {"ok": True, "dry_run": True}
@@ -792,6 +923,7 @@ def stop_k7_force(cfg):
     return {"ok": True, "remote": True, "force": True}
 
 
+@serialized_operation
 def stop_all(cfg=None):
     """依次发送 d、等待落盘、停止 rl_deploy、K7Master3 及手柄服务。"""
     cfg = cfg or {}

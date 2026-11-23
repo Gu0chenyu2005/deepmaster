@@ -57,17 +57,24 @@ Date November 2026
     return url.origin + "/api/cam";
   }
 
-  function wrap(action, cfg, onLine) {
+  function wrap(action, cfg, onLine, extra) {
     var note = function (t) { try { onLine && onLine(t); } catch (e) {} };
     note("→ 本机执行 " + action);
-    return post("/run/" + action, { cfg: cfg || {} })
+    var body = Object.assign({ cfg: cfg || {} }, extra || {});
+    return post("/run/" + action, body)
       .then(function (d) {
         if (d && d.ok === false) {
           note("✗ " + (d.error || "失败"));
           return { ok: false, error: d.error || "执行失败" };
         }
+        if (action === "cam-start" && d && d.camera_token) {
+          cameraToken = d.camera_token;
+        }
+        if (action === "cam-stop" || action === "control-stop" || action === "capture-stop") {
+          cameraToken = "";
+        }
         if (d && d.pid) { note("✓ pid " + d.pid); }
-        return { ok: true, code: 0, error: null };
+        return Object.assign({}, d || {}, { ok: true, code: 0, error: null });
       })
       .catch(function (e) {
         note("✗ " + e.message);
@@ -75,24 +82,44 @@ Date November 2026
       });
   }
 
+  var cameraToken = "";
+
+  function cameraQuery(extra) {
+    if (!cameraToken) { throw new Error("相机访问授权不可用，请重新启动相机预览"); }
+    return (extra ? extra + "&" : "") + "token=" + encodeURIComponent(cameraToken);
+  }
+
   window.dmBridge = {
     t1: function (cfg, onLine) { return wrap("t1", cfg, onLine); },
     tare: function (cfg, onLine) { return wrap("tare", cfg, onLine); },
-    t2: function (cfg, onLine) { return wrap("t2", cfg, onLine); },
+    t2: function (cfg, onLine, controlOnly) {
+      return wrap("t2", cfg, onLine, controlOnly ? { control_only: true } : null);
+    },
      
     z: function (cfg, onLine) { return wrap("z", cfg, onLine); },
     stop: function (cfg, onLine) { return wrap("stop", cfg, onLine); },
     captureStop: function (cfg, onLine) { return wrap("capture-stop", cfg, onLine); },
-    camStart: function (cfg, onLine) { return wrap("cam-start", cfg, onLine); },
+    controlStop: function (cfg, onLine) { return wrap("control-stop", cfg, onLine); },
+    camStart: function (cfg, onLine, mode) {
+      return wrap("cam-start", cfg, onLine, mode ? { mode: mode } : null);
+    },
+    camStop: function (cfg, onLine) { return wrap("cam-stop", cfg, onLine); },
+    webrtcOffer: function (payload) { return post("/webrtc/offer", payload); },
+    webrtcClose: function (sessionId) {
+      return post("/webrtc/close", { session_id: sessionId });
+    },
 
-    streamUrl: function (cfg, cam) {
+    streamUrl: function (cfg, cam, profile) {
       var base = cameraBase(cfg);
-      return base + "/stream/" + encodeURIComponent(cam || "wrist") + "?direct=" + Date.now();
+      var params = "direct=" + Date.now();
+      if (profile) { params += "&profile=" + encodeURIComponent(profile); }
+      params = cameraQuery(params);
+      return base + "/stream/" + encodeURIComponent(cam || "wrist") + "?" + params;
     },
 
     camHealth: function (cfg) {
       var base = cameraBase(cfg);
-      return fetch(base + "/health", { cache: "no-store" })
+      return fetch(base + "/health?" + cameraQuery(""), { cache: "no-store" })
         .then(function (r) { if (!r.ok) { throw new Error("HTTP " + r.status); } return r.json(); })
         .then(function (j) { return j.data !== undefined ? j.data : j; })
         .catch(function () { return null; });
@@ -101,7 +128,7 @@ Date November 2026
     frame: function (cfg, cam) {
       var base = cameraBase(cfg);
       return Promise.resolve(base + "/snap/" + encodeURIComponent(cam || "wrist") +
-                             "?t=" + Date.now());
+                             "?" + cameraQuery("t=" + Date.now()));
     },
 
     status: function () { return get("/run/status"); }

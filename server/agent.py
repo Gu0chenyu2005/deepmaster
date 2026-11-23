@@ -7,10 +7,13 @@
 import argparse
 import hashlib
 import hmac
+import glob
 import json
 import os
+import pwd
 import shutil
 import signal
+import secrets
 import socket
 import subprocess
 import sys
@@ -27,7 +30,7 @@ import cam        # noqa: E402
 import runner     # noqa: E402
 import system     # noqa: E402
 
-VERSION = "1.1"
+VERSION = "3.0.0"
 
 STATUS_PATTERNS = {
     "k7master3": ["K7Master3"],
@@ -62,10 +65,42 @@ STATE = {
     "discovery_port": 5111, 
     "api_port": 0,          
     "servers": {},          
+    "cam_mode": "shm",
+    "webrtc_token": "",
+    "camera_token": "",
 }
 ARCHIVE_LOCK = threading.RLock()
 ARCHIVE_JOBS = {}
 ARCHIVE_SEQ = 0
+VIDEO_DSCP = 0x20
+VIDEO_PRIORITY = 1
+VIDEO_NOTSENT_LOWAT = 16 * 1024
+
+
+def _prioritize_video_socket(sock):
+    """Mark preview traffic as background and limit queued TCP data."""
+    options = [
+        (socket.IPPROTO_IP, socket.IP_TOS, VIDEO_DSCP),
+        (socket.SOL_SOCKET, socket.SO_PRIORITY, VIDEO_PRIORITY),
+    ]
+    notsent = getattr(socket, "TCP_NOTSENT_LOWAT", None)
+    if notsent is not None:
+        options.append((socket.IPPROTO_TCP, notsent, VIDEO_NOTSENT_LOWAT))
+    for level, option, value in options:
+        try:
+            sock.setsockopt(level, option, value)
+        except OSError:
+            pass
+
+
+def _lower_current_thread_priority():
+    try:
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 5)
+    except (AttributeError, OSError):
+        try:
+            os.nice(5)
+        except OSError:
+            pass
 
 
 def load_cfg(path):
@@ -134,7 +169,10 @@ def save_cfg(update, allow_agent_token=False):
     STATE["cfg"] = merged
     STATE["data_root"] = root
     print("[agent] 配置已更新（%d 项）：%s" % (len(merged), path), flush=True)
-    return {"count": len(merged), "config": merged}
+    public = {k: v for k, v in merged.items()
+              if k not in ("agent_token", "sudo_pw", "dds_password")}
+    public["dds_password_set"] = bool(merged.get("dds_password"))
+    return {"count": len(merged), "config": public}
 
 
 def data_root():
@@ -314,30 +352,113 @@ def start_api(port):
     return None
 
 
-def start_cam_viewer():
-    """启动共享内存预览服务；失败不阻止采集。"""
+@runner.serialized_operation
+def start_cam_viewer(mode="shm"):
+    """启动共享内存或直连相机预览服务。"""
     script = STATE["cfg"].get("cam_viewer_script") or os.path.join(
         os.path.dirname(BASE), "cam", "camera_shm_viewer.py")
     if not os.path.exists(script):
         print("[agent] 没有 camera_shm_viewer.py，画面不可用", flush=True)
         return {"ok": False, "error": "脚本不存在：%s" % script}
     port = str(STATE["cfg"].get("cam_viewer_port") or 5000)
-    cmd = [sys.executable, script, "--auto", "--port", port]
+    if mode not in ("shm", "direct", "direct-webrtc"):
+        return {"ok": False, "error": "无效相机预览模式"}
+    if runner._alive(STATE["cam_key"]) and STATE.get("cam_mode") == mode:
+        return {"ok": True, "already": True,
+                "camera_token": STATE.get("camera_token", "")}
+    if runner._alive(runner.RL_KEY) and STATE.get("cam_mode") != mode:
+        return {"ok": False, "error": "采集程序运行中，无法切换相机模式"}
+    if mode in ("direct", "direct-webrtc"):
+        probe = _direct_camera_command([sys.executable, "-c",
+            "import pyrealsense2 as rs; "
+            "context = rs.context(); print(len(context.query_devices()))"])
+        try:
+            result = subprocess.run(probe, capture_output=True, text=True, timeout=10)
+            if result.returncode:
+                return {"ok": False, "error": "相机设备检查失败：%s" % result.stderr.strip()[-600:]}
+            count = int(result.stdout.strip().splitlines()[-1])
+            if count < 3:
+                return {"ok": False, "error": "远控需要三台 RealSense，当前识别到 %d 台，请检查 USB 连接和供电" % count}
+        except (OSError, subprocess.TimeoutExpired, ValueError, IndexError) as exc:
+            return {"ok": False, "error": "相机设备检查失败：%s" % exc}
+    if STATE.get("cam_mode") != mode:
+        stopped = runner.stop(STATE["cam_key"])
+        if not stopped.get("ok"):
+            return stopped
+    cmd = [sys.executable, script, "--port", port]
+    cmd.append("--direct" if mode in ("direct", "direct-webrtc") else "--auto")
+    env = {}
+    if mode == "direct-webrtc":
+        scheduling = runner._validate_control_scheduling()
+        if not scheduling.get("ok"):
+            return scheduling
+        STATE["webrtc_token"] = secrets.token_urlsafe(32)
+        env["DM_WEBRTC_TOKEN"] = STATE["webrtc_token"]
+        cmd.append("--webrtc")
+    STATE["camera_token"] = secrets.token_urlsafe(32)
+    cam.set_access_token(STATE["camera_token"])
+    env["DM_CAM_TOKEN"] = STATE["camera_token"]
+    if mode in ("direct", "direct-webrtc"):
+        cmd = _direct_camera_command(cmd)
+    if mode == "direct-webrtc":
+        cmd = ["taskset", "-c", "4-7", "nice", "-n", "-10"] + cmd
     r = runner.spawn(STATE["cam_key"], "camera_shm_viewer", cmd,
-                     cwd=os.path.dirname(script))
+                     cwd=os.path.dirname(script), env=env)
     if r.get("ok"):
-        print("[agent] 相机预览已启动 :%s" % port, flush=True)
+        STATE["cam_mode"] = mode
+        print("[agent] 相机预览已启动 mode=%s :%s" % (mode, port), flush=True)
     else:
+        STATE["camera_token"] = ""
+        cam.set_access_token("")
         print("[agent] 相机预览启动失败：%s" % r.get("error"), flush=True)
+    if r.get("ok"):
+        r["camera_token"] = STATE["camera_token"]
     return r
 
 
+def _clear_camera_tokens():
+    STATE["camera_token"] = ""
+    STATE["webrtc_token"] = ""
+    cam.set_access_token("")
+
+
+def _direct_camera_command(cmd):
+    """以 RealSense 用户绑定所属账号运行相机预览。"""
+    if os.geteuid() != 0:
+        return cmd
+    for module in glob.glob("/home/*/.local/lib/python*/site-packages/pyrealsense2*"):
+        try:
+            owner = pwd.getpwuid(os.stat(module).st_uid)
+            if owner.pw_uid == 0:
+                continue
+            runuser = shutil.which("runuser")
+            if runuser:
+                return [runuser, "-u", owner.pw_name, "--"] + cmd
+        except (KeyError, OSError):
+            continue
+    return cmd
+
+
+@runner.serialized_operation
 def stop_capture(cfg):
     """结束录制并释放预览读取进程，保留相机驱动与机械臂服务。"""
     result = runner.stop_capture(cfg)
     if result.get("ok"):
         cam = runner.stop(STATE["cam_key"]) or {"ok": True}
+        _clear_camera_tokens()
         result.setdefault("steps", []).append({"step": "stop_camera_preview", **cam})
+    return result
+
+
+@runner.serialized_operation
+def stop_control_only(cfg):
+    result = runner.stop_control_only(cfg)
+    if result.get("ok"):
+        camera = runner.stop(STATE["cam_key"]) or {"ok": True}
+        _clear_camera_tokens()
+        result.setdefault("steps", []).append({"step": "stop_direct_camera", **camera})
+        if not camera.get("ok"):
+            result.update(ok=False, error=camera.get("error", "相机预览停止失败"))
     return result
 
 
@@ -349,7 +470,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
 
         if self.command != "GET" or "/api/health" not in self.path:
-            sys.stderr.write("[agent] %s %s\n" % (self.address_string(), fmt % args))
+            parsed = urlparse(self.path)
+            safe = parsed.path
+            if parsed.path.startswith("/api/cam/") and parsed.query:
+                safe += "?token=[redacted]"
+            message = (fmt % args).replace(self.path, safe)
+            sys.stderr.write("[agent] %s %s\n" % (self.address_string(), message))
 
     def _json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -413,7 +539,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if head in ("hello", "health"):
             return self._ok(identity())
-        if head != "cam" and not self._authorized():
+        if head == "cam":
+            supplied = (q.get("token") or [""])[0]
+            expected = str(STATE.get("camera_token") or "")
+            if not self._authorized() and not (expected and supplied and
+                    hmac.compare_digest(expected, supplied)):
+                return self._err(401, "相机请求未授权")
+        elif head == "webrtc":
+            return self._err(405, "WebRTC 信令仅支持 POST")
+        elif not self._authorized():
             return self._err(401, "采集端请求未授权")
 
         try:
@@ -428,8 +562,42 @@ class Handler(BaseHTTPRequestHandler):
     def _route(self, rest, q):
         head = rest[0] if rest else ""
 
+        if head == "webrtc" and len(rest) >= 2 and rest[1] in ("offer", "close"):
+            body = self._body()
+            if not isinstance(body, dict):
+                return self._err(400, "WebRTC 信令必须是 JSON 对象")
+            session_id = str(body.get("session_id") or "")
+            sdp = str(body.get("sdp") or "")
+            if (not session_id or len(session_id) > 80 or
+                    (rest[1] == "offer" and (not sdp or len(sdp) > 262144))):
+                return self._err(400, "WebRTC 信令参数无效")
+            try:
+                from urllib.request import Request, urlopen
+                payload = json.dumps(body).encode("utf-8")
+                request = Request(
+                    "http://127.0.0.1:%s/webrtc/%s" % (
+                        STATE["cfg"].get("cam_viewer_port") or 5000, rest[1]),
+                    data=payload,
+                    headers={"Content-Type": "application/json",
+                             "X-DM-WebRTC-Token": STATE.get("webrtc_token", "")},
+                    method="POST")
+                with urlopen(request, timeout=20) as response:
+                    return self._ok(json.loads(response.read() or b"{}"))
+            except Exception as exc:  # noqa: BLE001
+                from urllib.error import HTTPError
+                if isinstance(exc, HTTPError):
+                    try:
+                        detail = json.loads(exc.read(4096) or b"{}").get("error")
+                    except (ValueError, OSError, AttributeError):
+                        detail = None
+                    if detail:
+                        return self._err(502, "WebRTC 信令失败：%s" % detail)
+                return self._err(502, "WebRTC 信令失败：%s" % exc)
+
         if head == "host":
             config = effective_cfg()
+            config.pop("agent_token", None)
+            config.pop("sudo_pw", None)
             config["dds_password_set"] = bool(config.pop("dds_password", ""))
             return self._ok({
                 "config": config,
@@ -460,7 +628,8 @@ class Handler(BaseHTTPRequestHandler):
                 body, ctype = cam.snapshot(key or "wrist")
                 return self._bytes(200, body, ctype)
             if what == "stream":
-                return self._stream(cam.open_stream(key or "wrist"))
+                profile = (q.get("profile") or ["default"])[0]
+                return self._stream(cam.open_stream(key or "wrist", profile))
             return self._err(404, "未知相机接口：%s" % what)
 
         if head == "files":
@@ -483,6 +652,12 @@ class Handler(BaseHTTPRequestHandler):
         parts = [unquote(p) for p in u.path.strip("/").split("/") if p]
         rest = parts[1:]
         head = rest[0] if rest else ""
+        if rest[:1] == ["webrtc"]:
+            try:
+                if int(self.headers.get("Content-Length", "0") or 0) > 262656:
+                    return self._err(413, "WebRTC 信令超过大小限制")
+            except ValueError:
+                return self._err(400, "WebRTC 信令长度无效")
 
         if head == "assign":
             body = self._body()
@@ -510,8 +685,48 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err(500, err)
             return self._ok({"api_port": port, "device_id": STATE["device_id"]})
 
+        if rest == ["pairing", "reset"]:
+            self._body()
+            if self.server.server_port != STATE["discovery_port"]:
+                return self._err(403, "配对重置仅允许通过设备发现端口执行")
+            try:
+                save_cfg({"agent_token": ""}, allow_agent_token=True)
+            except Exception as e:  # noqa: BLE001
+                return self._err(500, "清除采集端配对令牌失败：%s" % e)
+            return self._ok({"reset": True})
+
         if not self._authorized():
             return self._err(401, "采集端请求未授权")
+
+        if head == "webrtc" and len(rest) == 2 and rest[1] in ("offer", "close"):
+            body = self._body()
+            session_id = str(body.get("session_id") or "")
+            sdp = str(body.get("sdp") or "")
+            if (not session_id or len(session_id) > 80 or
+                    (rest[1] == "offer" and (not sdp or len(sdp) > 262144))):
+                return self._err(400, "WebRTC 信令参数无效")
+            try:
+                from urllib.request import Request, urlopen
+                payload = json.dumps({"session_id": session_id, "sdp": sdp}).encode("utf-8")
+                request = Request(
+                    "http://127.0.0.1:%s/webrtc/%s" % (
+                        STATE["cfg"].get("cam_viewer_port") or 5000, rest[1]),
+                    data=payload,
+                    headers={"Content-Type": "application/json",
+                             "X-DM-WebRTC-Token": STATE.get("webrtc_token", "")},
+                    method="POST")
+                with urlopen(request, timeout=20) as response:
+                    return self._ok(json.loads(response.read() or b"{}"))
+            except Exception as exc:  # noqa: BLE001
+                from urllib.error import HTTPError
+                if isinstance(exc, HTTPError):
+                    try:
+                        detail = json.loads(exc.read(4096) or b"{}").get("error")
+                    except (ValueError, OSError, AttributeError):
+                        detail = None
+                    if detail:
+                        return self._err(502, "WebRTC 信令失败：%s" % detail)
+                return self._err(502, "WebRTC 信令失败：%s" % exc)
 
         if head == "files" and len(rest) >= 2 and rest[1] == "rmdir-empty":
             body = self._body()
@@ -568,22 +783,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err(500, "配置写回失败：%s" % e)
             return self._ok(r)
 
-        if parts[:2] != ["api", "run"]:
-            return self._err(404, "只支持 POST /api/run/{action}、/api/assign 和 /api/config")
-
         action = parts[2] if len(parts) >= 3 else ""
         body = self._body()
+        if parts[:2] != ["api", "run"]:
+            return self._err(404, "只支持 POST /api/run/{action}、/api/webrtc/{action}、/api/assign 和 /api/config")
         try:
             cfg = merge_cfg(body.get("cfg"))
         except (ValueError, OSError) as e:
             return self._err(400, str(e))
 
         if action == "cam-start":
-            r = start_cam_viewer()
+            r = start_cam_viewer(body.get("mode") or "shm")
         elif action == "cam-stop":
             r = runner.stop(STATE["cam_key"]) or {"ok": True}
+            _clear_camera_tokens()
         elif action == "capture-stop":
             r = stop_capture(cfg)
+        elif action == "control-stop":
+            r = stop_control_only(cfg)
+        elif action == "t2":
+            r = runner.run_t2(cfg, control_only=bool(body.get("control_only")))
         elif action in ACTIONS:
             try:
                 r = ACTIONS[action](cfg)
@@ -615,6 +834,11 @@ class Handler(BaseHTTPRequestHandler):
     def _stream(self, opened):
         """流式转发 MJPEG，使用连接关闭标识响应结束。"""
         resp, ctype = opened
+        _lower_current_thread_priority()
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024)
+        _prioritize_video_socket(self.connection)
+        self.connection.settimeout(1.0)
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")

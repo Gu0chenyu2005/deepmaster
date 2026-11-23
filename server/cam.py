@@ -8,6 +8,7 @@ import json
 import os
 import threading
 import time
+from urllib.parse import quote
 from urllib.request import urlopen
 
 DEFAULT_UPSTREAM = "http://127.0.0.1:5000"
@@ -25,10 +26,22 @@ _ALIASES = {
 _HEALTH_TTL = 2.0
 _HEALTH = {"ts": 0.0, "data": None}
 _HEALTH_LOCK = threading.Lock()
+_ACCESS_TOKEN = ""
 
 
 class CamUnavailable(Exception):
     """相机预览服务不可用。"""
+
+
+def set_access_token(token):
+    global _ACCESS_TOKEN
+    _ACCESS_TOKEN = str(token or "")
+
+
+def _upstream_url(path):
+    separator = "&" if "?" in path else "?"
+    suffix = separator + "token=" + quote(_ACCESS_TOKEN) if _ACCESS_TOKEN else ""
+    return upstream() + path + suffix
 
 
 def upstream():
@@ -62,7 +75,7 @@ def upstream_health(force=False):
             return _HEALTH["data"]
     data = None
     try:
-        with urlopen(upstream() + "/health", timeout=2.5) as r:
+        with urlopen(_upstream_url("/health"), timeout=2.5) as r:
             data = json.loads(r.read() or b"{}")
     except Exception:          # noqa: BLE001
         data = None
@@ -94,7 +107,7 @@ def snapshot(key):
 
     idx = video_index(key)
     try:
-        with urlopen("%s/snapshot%d.jpg" % (upstream(), idx), timeout=4) as r:
+        with urlopen(_upstream_url("/snapshot%d.jpg" % idx), timeout=4) as r:
             body = r.read()
             ctype = r.headers.get("Content-Type") or "image/jpeg"
     except Exception as e:      # noqa: BLE001
@@ -104,11 +117,14 @@ def snapshot(key):
     return body, ctype
 
 
-def open_stream(key):
+def open_stream(key, profile="default"):
     """返回 (response, content_type)；调用方负责流式读取并关闭响应。"""
     idx = video_index(key)
+    if profile not in ("default", "remote", "remote_low", "remote_min",
+                       "control", "control_low", "control_min"):
+        raise CamUnavailable("无效预览档位")
     try:
-        resp = urlopen("%s/video%d" % (upstream(), idx), timeout=15)
+        resp = urlopen(_upstream_url("/video%d?profile=%s" % (idx, profile)), timeout=15)
     except Exception as e:      # noqa: BLE001
         raise CamUnavailable("连不上上游流: %s" % e)
     ctype = resp.headers.get("Content-Type") or "multipart/x-mixed-replace; boundary=frame"
@@ -129,7 +145,9 @@ def health():
                 if _norm(s.get("label")) == label:
                     idx = i + 1
                     item["size"] = s.get("size")
-                    item["fps"] = s.get("fps_measured")
+                    item["fps"] = s.get("fps_measured", s.get("measured_fps"))
+                    item["source_fps"] = s.get("fps_header", s.get("source_fps"))
+                    item["age_ms"] = s.get("age_ms")
                     item["error"] = s.get("error") or None
                     item["online"] = bool(s.get("present")) and not s.get("error")
                     break

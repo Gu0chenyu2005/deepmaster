@@ -43,7 +43,9 @@ build_orin() {
 from pathlib import Path
 import sys
 binary = Path(sys.argv[1]).read_bytes()
-for token in (b'ARMDOG_CAMERA_PORTS_FILE', b'ARMDOG_SHARED_FRAME_CAMERAS', b'ARMDOG_DATA_ROOT'):
+for token in (b'ARMDOG_CAMERA_PORTS_FILE', b'ARMDOG_SHARED_FRAME_CAMERAS',
+              b'ARMDOG_DATA_ROOT', b'ARMDOG_CAMERA_DISABLE',
+              b'ARMDOG_CONTROL_ONLY'):
     if token not in binary:
         raise SystemExit('请先同步最新采集程序二进制')
 PY
@@ -63,6 +65,7 @@ PY
   cp -a "$SRC/runtime/deploy" "$SRC/runtime/service" "$SRC/runtime/manifest.json" "$P/runtime/"
   PATCHELF="$PATCHELF_BIN" python3 "$ROOT/packaging/prepare-orin-runtime.py" "$P"
   cp -a "$ROOT/orin/camera_shm_viewer.py" "$P/cam/"
+  cp -a "$ROOT/orin/webrtc_preview.py" "$P/cam/"
   for name in agent runner cam system; do cp -a "$ROOT/server/$name.py" "$P/agent/"; done
   cp -a "$ROOT/packaging/host_config.orin.json" "$P/host_config.json"
   cp -a "$ROOT/packaging/install-orin.sh" "$P/install.sh"
@@ -90,6 +93,7 @@ build_server() {
   local P="$STAGE/dm-web"
   mkdir -p "$P/server"
   cp -a "$ROOT/index.html" "$ROOT/assets" "$P/"
+  cp -a "$ROOT/VERSION" "$P/VERSION"
   for name in api run_web auth db runner system cam geo auto_qc lerobot_export data_clean; do
     cp -a "$ROOT/server/$name.py" "$P/server/"
   done

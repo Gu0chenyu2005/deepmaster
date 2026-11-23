@@ -50,7 +50,7 @@ TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(TOOL_DIR)
 
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "3.0.0"
 DEFAULT_DATA = os.environ.get("DM_DATA_DIR", os.path.join(PROJECT_DIR, "datasets"))
 _pos = [a for a in sys.argv[1:] if not a.startswith("-")]
 INIT_DATA = os.path.abspath(_pos[0]) if _pos else DEFAULT_DATA
@@ -70,6 +70,35 @@ PORT_POOL_END = 65535
 
 _AGENT_CACHE = {"ts": 0.0, "url": ""}
 _AGENT_TTL = 3.0
+VIDEO_DSCP = 0x20
+VIDEO_PRIORITY = 1
+VIDEO_NOTSENT_LOWAT = 16 * 1024
+
+
+def _prioritize_video_socket(sock):
+    """Mark preview traffic as background and limit queued TCP data."""
+    options = [
+        (socket.IPPROTO_IP, socket.IP_TOS, VIDEO_DSCP),
+        (socket.SOL_SOCKET, socket.SO_PRIORITY, VIDEO_PRIORITY),
+    ]
+    notsent = getattr(socket, "TCP_NOTSENT_LOWAT", None)
+    if notsent is not None:
+        options.append((socket.IPPROTO_TCP, notsent, VIDEO_NOTSENT_LOWAT))
+    for level, option, value in options:
+        try:
+            sock.setsockopt(level, option, value)
+        except OSError:
+            pass
+
+
+def _lower_current_thread_priority():
+    try:
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 5)
+    except (AttributeError, OSError):
+        try:
+            os.nice(5)
+        except OSError:
+            pass
 
 
 def agent_url(force=False):
@@ -94,12 +123,25 @@ def agent_on():
     return bool(agent_url())
 
 
+def _agent_run_payload(action, body):
+    payload = {"cfg": body.get("cfg") or {}}
+    if action == "t2":
+        payload["control_only"] = bool(body.get("control_only"))
+    elif action == "cam-start":
+        payload["mode"] = body.get("mode") or "shm"
+    return payload
+
+
 class AgentDown(Exception):
     """采集端连接不可用。"""
 
 
 class AgentError(Exception):
     """采集端请求执行失败。"""
+
+    def __init__(self, message, status=None):
+        self.status = status
+        super().__init__(message)
 
 
 def _agent_open(path, payload=None, timeout=30, base=None, auth_token=None):
@@ -124,7 +166,8 @@ def _agent_open(path, payload=None, timeout=30, base=None, auth_token=None):
             obj = json.loads(e.read() or b"{}")
         except Exception:               # noqa: BLE001
             obj = {}
-        raise AgentError(obj.get("message") or ("采集端返回 HTTP %s" % e.code))
+        raise AgentError(obj.get("message") or ("采集端返回 HTTP %s" % e.code),
+                         status=e.code)
     except URLError as e:
         raise AgentDown("连不上采集端 %s：%s" % (url, getattr(e, "reason", e)))
     except OSError as e:
@@ -252,6 +295,7 @@ def _probe_agent(ip, port=None, timeout=0.25):
         "host": d.get("host"),
         "arch": d.get("arch"),
         "version": d.get("version"),
+        "auth_enabled": bool(d.get("auth_enabled")),
         "data_root": d.get("data_root"),
         "disk": d.get("disk"),
         "uptime_s": d.get("uptime_s"),
@@ -347,12 +391,19 @@ def op_agent_connect(body, user=None):
     hello = _probe_agent(ip, dport, timeout=2.0)
     if not hello:
         raise err400("这台机器上没有可用的采集端（%s:%d 握手失败）" % (ip, dport))
+    agent_version = str(hello.get("version") or "").strip()
+    if agent_version != APP_VERSION:
+        shown_version = agent_version or "未知"
+        raise err400("服务端与采集端版本不一致，禁止配对（服务端 %s，采集端 %s）"
+                     % (APP_VERSION, shown_version))
     dev_id = hello.get("device_id") or ""
     if not dev_id:
         raise err400("采集端没有报 device_id，版本太旧？")
 
     reg = _dev_registry()
     old = reg.get(dev_id) or {}
+    if not old.get("token") and hello.get("auth_enabled"):
+        raise err400("采集端已配对，但服务端缺少该设备的令牌记录。请在采集端和服务端重置该设备的配对信息后重新连接")
     token = str(old.get("token") or secrets.token_urlsafe(36))
     if not old.get("token"):
         pending = dict(old, ip=ip, port=0, discovery_port=dport, token=token)
@@ -378,6 +429,14 @@ def op_agent_connect(body, user=None):
             if (_attempt == 0 and not old.get("token") and
                     isinstance(e, AgentError) and "端口" in str(e) and "起不来" in str(e)):
                 continue
+            if isinstance(e, AgentError) and e.status == 401:
+                if old.get("token"):
+                    detail = "服务端保存的设备配对令牌与采集端不一致。请在采集端和服务端重置该设备的配对信息后重新连接"
+                elif hello.get("auth_enabled"):
+                    detail = "采集端已有配对令牌，但服务端未找到对应记录。请在采集端和服务端重置该设备的配对信息后重新连接"
+                else:
+                    detail = "采集端拒绝了首次配对请求，请确认设备身份和采集端版本后重试"
+                raise err400("采集端配对授权失败：%s" % detail)
             raise err400("配对或下发通信端口失败：%s" % e)
 
 
@@ -425,12 +484,71 @@ def op_agent_select(body, user=None):
         raise err400("参数必须是对象")
     url = str(body.get("url") or "").strip().rstrip("/")
     if url and not re.match(r"^https?://[0-9A-Za-z_.\-]+(:\d+)?$", url):
-        raise err400("地址格式不对，应该像 http://192.168.31.20:5300")
+        raise err400("地址格式错误，例如 http://192.168.31.20:5300")
     with db.connect() as conn:
         db.set_setting(conn, "agent_url", url)
         db.audit(conn, user["account"] if user else None, "agent_select", url or "(本机)")
     agent_url(force=True)
     return {"url": url}
+
+
+def op_agent_reset_pairing(user=None):
+    """向扫描到的采集端重置配对，并清理对应服务端记录。"""
+    if AGENT_URL_ENV:
+        raise err400("采集端地址由服务器环境变量固定，不能从网页重置配对")
+
+    devices = op_agent_scan({}, None).get("devices") or []
+    if not devices:
+        raise err400("当前网络没有扫描到可重置的采集端")
+
+    def reset_device(device):
+        ip = str(device.get("ip") or "")
+        try:
+            port = int(device.get("discovery_port") or DISCOVERY_PORT)
+            if not ip or not 1 <= port <= 65535:
+                raise AgentError("设备地址或发现端口无效")
+            base = "http://%s:%d" % (ip, port)
+            identity = _agent_call("/api/hello", timeout=5, base=base)
+            device_id = str(identity.get("device_id") or "")
+            if not device_id or device_id != str(device.get("device_id") or ""):
+                raise AgentError("设备身份校验失败")
+            _agent_call("/api/pairing/reset", {}, timeout=8, base=base)
+            return {"device_id": device_id, "ip": ip, "host": device.get("host"),
+                    "reset": True, "error": ""}
+        except (AgentDown, AgentError, TypeError, ValueError) as exc:
+            return {"device_id": device.get("device_id") or "", "ip": ip,
+                    "host": device.get("host"), "reset": False,
+                    "error": str(exc)}
+
+    with ThreadPoolExecutor(max_workers=min(16, len(devices))) as pool:
+        results = list(pool.map(reset_device, devices))
+    reset_ids = {item["device_id"] for item in results if item["reset"]}
+    reset_ips = {item["ip"] for item in results if item["reset"]}
+    reg = _dev_registry()
+    for device_id in reset_ids:
+        reg.pop(device_id, None)
+    for key, candidate in list(reg.items()):
+        if isinstance(candidate, dict) and str(candidate.get("ip") or "") in reset_ips:
+            reg.pop(key, None)
+
+    selected = agent_url(force=True)
+    selected_host = (urlparse(selected).hostname or "").lower() if selected else ""
+    selected_cleared = selected_host in {ip.lower() for ip in reset_ips}
+    try:
+        with db.connect() as conn:
+            db.set_setting(conn, "agent_devices", json.dumps(reg, ensure_ascii=False))
+            if selected_cleared:
+                db.set_setting(conn, "agent_url", "")
+            db.audit(conn, user["account"] if user else None,
+                     "agent_pairing_reset", "%d/%d" % (len(reset_ids), len(devices)))
+    except Exception as exc:  # noqa: BLE001
+        agent_url(force=True)
+        raise err400("采集端令牌已清除，但服务端保存失败：%s" % exc)
+
+    agent_url(force=True)
+    return {"total": len(devices), "reset_count": len(reset_ids),
+            "failed_count": len(devices) - len(reset_ids),
+            "selected_cleared": selected_cleared, "devices": results}
 
 
 PULL_KEY = "last_pull"          
@@ -868,24 +986,26 @@ MIN_FREE_BYTES = int(os.environ.get("DM_MIN_FREE_MB", "200")) * 1024 * 1024
 
 
 def resolve_dir(raw):
-
     if not raw:
         return None
     raw = unquote(str(raw)).strip()
-    cands = []
+    data_root = os.path.realpath(INIT_DATA)
+    candidates = []
     if os.path.isabs(raw):
-        cands.append(raw)
+        candidates.append(raw)
     else:
-        cands.append(os.path.join(INIT_DATA, raw))
-        cands.append(os.path.join(DEFAULT_DATA, raw))
-        cands.append(os.path.join(PROJECT_DIR, raw))
-    for c in cands:
-        p = os.path.abspath(c)
+        candidates.extend((os.path.join(INIT_DATA, raw),
+                           os.path.join(PROJECT_DIR, raw)))
+    for candidate in candidates:
+        p = os.path.realpath(candidate)
+        try:
+            if os.path.commonpath((data_root, p)) != data_root:
+                continue
+        except ValueError:
+            continue
         if not os.path.isdir(p):
             continue
-        for root in ALLOW_ROOTS:
-            if p == root or p.startswith(root + os.sep):
-                return p
+        return p
     return None
 
 
@@ -900,6 +1020,15 @@ def rel_to_data(p):
     return p
 
 
+def _inside_data_root(path):
+    root = os.path.realpath(INIT_DATA)
+    target = os.path.realpath(path)
+    try:
+        return os.path.commonpath((root, target)) == root
+    except ValueError:
+        return False
+
+
 def list_episode_files(d):
     out = []
     try:
@@ -908,8 +1037,9 @@ def list_episode_files(d):
         return out
     for name in names:
         m = EP_RE.match(name)
-        if m:
-            out.append((int(m.group(1)), os.path.join(d, name)))
+        path = os.path.join(d, name)
+        if m and _inside_data_root(path) and os.path.isfile(path):
+            out.append((int(m.group(1)), path))
     out.sort()
     return out
 
@@ -923,7 +1053,7 @@ def list_records(d):
         return out
     for name in names:
         full = os.path.join(d, name)
-        if not os.path.isfile(full):
+        if not _inside_data_root(full) or not os.path.isfile(full):
             continue
         if not (name.endswith(".hdf5") or name.endswith(".h5")):
             continue
@@ -1551,8 +1681,8 @@ def op_dirs(path_raw, remote=False):
         if name.startswith(".") or name.endswith(REJECTED_SUFFIX):
 
             continue
-        full = os.path.join(base, name)
-        if not os.path.isdir(full):
+        full = resolve_dir(os.path.join(base, name))
+        if not full:
             continue
         cnt = len(list_episode_files(full))
         rec = len(list_records(full))
@@ -2010,11 +2140,16 @@ def op_config_get():
         data = json.loads(raw) if raw else {}
     except Exception:                   # noqa: BLE001
         data = {}
+    data.pop("agent_token", None)
+    data.pop("sudo_pw", None)
+    data.pop("dds_password", None)
     data.pop("_agent", None)
     if agent_on():
         try:
             host = _agent_call("/api/host", timeout=6)
             data = dict(host.get("config") or {})
+            data.pop("agent_token", None)
+            data.pop("sudo_pw", None)
             data["dds_password_set"] = (
                 bool(data.pop("dds_password", "")) or bool(data.get("dds_password_set")))
             if host.get("data_root"):
@@ -2051,6 +2186,8 @@ def op_config_save(payload, user=None):
     if not isinstance(payload, dict):
         raise err400("配置必须是对象")
     stored = dict(payload)
+    stored.pop("agent_token", None)
+    stored.pop("sudo_pw", None)
     stored.pop("dds_password", None)
     stored.pop("dds_password_set", None)
     stored.pop("_agent", None)
@@ -2060,7 +2197,7 @@ def op_config_save(payload, user=None):
     pushed = None
     if agent_on():
         clean = {k: v for k, v in payload.items()
-                 if k not in ("_agent", "dds_password_set")}
+                 if k not in ("_agent", "dds_password_set", "agent_token", "sudo_pw")}
         try:
             _agent_call("/api/config", {"cfg": clean}, timeout=10)
             pushed = True
@@ -2745,6 +2882,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _relay(self, resp, ctype):
         """逐块转发响应并及时刷新输出。"""
+        _lower_current_thread_priority()
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024)
+        _prioritize_video_socket(self.connection)
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
@@ -2921,6 +3062,7 @@ class Handler(BaseHTTPRequestHandler):
         if head == "users":
             return self._ok(op_users_list(self._user(required=True, min_role="admin")))
         if head == "config":
+            self._user(required=True, min_role="user")
             return self._ok(op_config_get())
 
 
@@ -2949,6 +3091,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._ok(op_autocheck_status((q.get("dir") or [""])[0]))
 
         if head == "cam" and len(rest) >= 2:
+            self._user(required=True, min_role="user")
             return self._cam(rest[1], rest[2] if len(rest) >= 3 else "")
         if head == "episode" and len(rest) >= 3:
             d = resolve_dir((q.get("dir") or [""])[0])
@@ -2982,6 +3125,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         parts = [p for p in url.path.split("/") if p]
         try:
+            if parts[:2] == ["api", "webrtc"] and int(self.headers.get("Content-Length", "0") or 0) > 262656:
+                return self._send(413, {"code": 413, "message": "WebRTC 信令超过大小限制"})
             self._raw_body = None
             self._drain()
             if not parts or parts[0] != "api":
@@ -3067,6 +3212,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._ok(op_agent_connect(self._body(), user))
             if act == "select":
                 return self._ok(op_agent_select(self._body(), user))
+            if act == "reset-pairing":
+                admin = self._user(required=True, min_role="admin")
+                return self._ok(op_agent_reset_pairing(admin))
             raise err404("未知设备接口：%s" % act)
 
         if head == "config":
@@ -3125,16 +3273,42 @@ class Handler(BaseHTTPRequestHandler):
                                             body.get("status"),
                                             body.get("comment"), user))
 
+        if head == "webrtc" and len(rest) >= 2 and rest[1] in ("offer", "close"):
+            user = self._user(required=True, min_role="user")
+            body = self._body()
+            if not isinstance(body, dict):
+                raise err400("WebRTC 信令必须是 JSON 对象")
+            session_id = str(body.get("session_id") or "")
+            sdp = str(body.get("sdp") or "")
+            if (not session_id or len(session_id) > 80 or
+                    (rest[1] == "offer" and (not sdp or len(sdp) > 262144))):
+                raise err400("WebRTC 信令参数无效")
+            if not agent_on():
+                raise err400("WebRTC 直连预览需要在线采集端")
+            try:
+                result = _agent_call("/api/webrtc/" + rest[1],
+                                     {"session_id": session_id, "sdp": sdp},
+                                     timeout=20)
+            except AgentDown as exc:
+                return self._send(503, {"code": 503, "message": str(exc),
+                                        "agent_down": True})
+            except AgentError as exc:
+                return self._send(502, {"code": 502, "message": str(exc)})
+            with db.connect() as conn:
+                db.audit(conn, user["account"], "webrtc_" + rest[1], "agent", None)
+            return self._ok(result)
+
         if head == "run" and len(rest) >= 2:
             user = self._user(required=True, min_role="user")
             action = rest[1]
-            cfg = (self._body() or {}).get("cfg") or {}
+            body = self._body() or {}
+            cfg = body.get("cfg") or {}
             if agent_on():
 
 
                 try:
                     r = _agent_call("/api/run/" + quote(action),
-                                    {"cfg": cfg}, timeout=120)
+                                    _agent_run_payload(action, body), timeout=120)
                 except AgentDown as e:
                     return self._send(503, {"code": 503, "message": str(e),
                                             "agent_down": True})
@@ -3151,7 +3325,16 @@ class Handler(BaseHTTPRequestHandler):
             elif action == "tare":
                 r = runner.run_tare(cfg)
             elif action == "t2":
-                r = runner.run_t2(cfg)
+                r = runner.run_t2(cfg, control_only=bool(body.get("control_only")))
+            elif action == "cam-start":
+                r = {"ok": False, "error": "直连相机预览需要在线采集端代理"}
+            elif action == "cam-stop":
+                r = runner.stop("camview")
+            elif action == "control-stop":
+                r = runner.stop_control_only(cfg)
+                if r.get("ok"):
+                    camera = runner.stop("camview") or {"ok": True}
+                    r.setdefault("steps", []).append({"step": "stop_direct_camera", **camera})
             elif action == "z":
                 r = runner.inject_z(cfg)
             elif action == "service-start":

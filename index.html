@@ -13,8 +13,8 @@ Date November 2026
 <link rel="icon" type="image/svg+xml" href="assets/logo/deepmaster-mark.svg">
 <link rel="icon" type="image/png" sizes="32x32" href="assets/logo/mark-ink-32.png">
 <link rel="apple-touch-icon" href="assets/logo/mark-ink-128.png">
-<link rel="stylesheet" href="assets/css/tokens.css?v=1794301279">
-<link rel="stylesheet" href="assets/css/site.css?v=1794301279">
+<link rel="stylesheet" href="assets/css/tokens.css?v=1794301279-white-rail">
+<link rel="stylesheet" href="assets/css/site.css?v=1794301279-glass-manage-actions">
 
 
 <script>(function () {
@@ -29,6 +29,16 @@ Date November 2026
 </script>
 </head>
 <body>
+
+<!-- Shared SVG displacement filter based on shuding/liquid-glass. -->
+<svg class="dm-liquid-filter" aria-hidden="true" focusable="false" width="0" height="0">
+  <defs>
+    <filter id="dm-liquid-glass-filter" x="-12%" y="-12%" width="124%" height="124%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.018 0.024" numOctaves="2" seed="17" result="dm-liquid-noise" />
+      <feDisplacementMap in="SourceGraphic" in2="dm-liquid-noise" scale="10" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+  </defs>
+</svg>
 
 <div class="shell">
 
@@ -309,7 +319,6 @@ Date November 2026
 
         
         <figure class="robot" id="robot" aria-hidden="true">
-          <span class="robot__glow"></span>
           <img class="robot__img" src="assets/robot/m20-lynx.png" alt="" draggable="false">
         </figure>
 
@@ -332,9 +341,9 @@ Date November 2026
       <header class="pagehead pagehead--row">
         <h1 class="pagehead__title" id="t-manage">登陆管理</h1>
         <div class="status-acts">
-          <button class="btn btn--tertiary btn--sm" type="button" id="mgr-reset-code"
+          <button class="btn btn--glass btn--sm" type="button" id="mgr-reset-code"
                   title="为忘记密码的同事签发一次性重置码">签发重置码</button>
-          <button class="btn btn--tertiary btn--sm" type="button" id="mgr-refresh">刷新</button>
+          <button class="btn btn--glass btn--sm" type="button" id="mgr-refresh">刷新</button>
         </div>
       </header>
 
@@ -513,7 +522,15 @@ Date November 2026
       <div id="cap-idle">
         <header class="pagehead pagehead--row">
           <h1 class="pagehead__title" id="t-capture">数据采集</h1>
-          <button class="btn btn--primary" type="button" id="btn-new-task">开始采集</button>
+          <div class="cap-start-actions">
+            <div class="cap-mode-switch" id="cap-mode-switch" data-mode="near" role="group" aria-label="采集控制模式">
+              <span class="cap-mode-switch__thumb" aria-hidden="true"></span>
+              <button type="button" data-capture-mode="near" aria-pressed="true">近控</button>
+              <button type="button" data-capture-mode="remote" aria-pressed="false">远控</button>
+              <button type="button" data-capture-mode="control" aria-pressed="false">远控仅控制</button>
+            </div>
+            <button class="btn btn--primary" type="button" id="btn-new-task">开始采集</button>
+          </div>
         </header>
 
         
@@ -545,6 +562,7 @@ Date November 2026
           <div class="cap-head">
             <h1 class="pagehead__title" id="t-capture-live">采集</h1>
             <p class="cap-head__sub" id="cap-dir"></p>
+            <p class="cap-mode-label" id="cap-mode-label"></p>
           </div>
           <div class="cap-head__acts">
             
@@ -555,9 +573,13 @@ Date November 2026
         </header>
 
         
+        <div class="cap-preview-health" id="cap-preview-health" hidden>
+          <span id="cap-preview-status">正在连接采集端画面</span>
+          <span id="cap-preview-detail"></span>
+        </div>
         <div class="cap-stage" id="cap-stage">
           <figure class="cap-cam" data-cam="wrist">
-            <div class="cap-cam__head"><span>腕部</span></div>
+            <div class="cap-cam__head"><span>腕部</span><span class="cap-cam__fps" data-cam-fps="wrist"></span></div>
             <div class="cap-cam__body">
               <img id="cap-img-wrist" alt="">
               <div class="cap-cam__ph" hidden>
@@ -583,7 +605,7 @@ Date November 2026
             </div>
           </figure>
           <figure class="cap-cam" data-cam="global">
-            <div class="cap-cam__head"><span>头部</span></div>
+            <div class="cap-cam__head"><span>头部</span><span class="cap-cam__fps" data-cam-fps="global"></span></div>
             <div class="cap-cam__body">
               <img id="cap-img-global" alt="">
               <div class="cap-cam__ph" hidden>
@@ -609,7 +631,7 @@ Date November 2026
             </div>
           </figure>
           <figure class="cap-cam" data-cam="third">
-            <div class="cap-cam__head"><span>第三人称</span></div>
+            <div class="cap-cam__head"><span>第三人称</span><span class="cap-cam__fps" data-cam-fps="third"></span></div>
             <div class="cap-cam__body">
               <img id="cap-img-third" alt="">
               <div class="cap-cam__ph" hidden>
@@ -635,6 +657,30 @@ Date November 2026
             </div>
           </figure>
         </div>
+        <section class="cap-latency" id="cap-latency" aria-label="图传性能" hidden>
+          <div class="cap-latency__head">
+            <span>图传性能</span>
+            <div class="cap-latency__legend" aria-label="相机图例">
+              <span><i class="is-wrist"></i>腕部</span>
+              <span><i class="is-global"></i>头部</span>
+              <span><i class="is-third"></i>第三人称</span>
+            </div>
+          </div>
+          <div class="cap-latency__metrics">
+            <div class="cap-latency__metric">
+              <div class="cap-latency__metric-head"><span>端到端延迟</span><output id="cap-e2e-value">等待视频帧</output></div>
+              <canvas id="cap-e2e-chart" height="64" aria-label="三路视频采集至浏览器显示的端到端延迟曲线"></canvas>
+            </div>
+            <div class="cap-latency__metric">
+              <div class="cap-latency__metric-head"><span>帧间隔</span><output id="cap-interval-value">--</output></div>
+              <canvas id="cap-interval-chart" height="64" aria-label="三路视频相邻显示帧之间的时间间隔曲线"></canvas>
+            </div>
+            <div class="cap-latency__metric">
+              <div class="cap-latency__metric-head"><span>帧率</span><output id="cap-fps-value">--</output></div>
+              <canvas id="cap-fps-chart" height="64" aria-label="三路视频每秒实际显示帧数曲线"></canvas>
+            </div>
+          </div>
+        </section>
 
         
         <div class="cap-veil" id="cap-veil" hidden>
@@ -927,7 +973,7 @@ Date November 2026
               </div>
               <div class="rv-slider">
                 <div class="rv-band" id="rv-band"></div>
-                <input type="range" id="rv-range" min="0" max="0" value="0" step="1">
+                <input type="range" id="rv-range" min="0" max="0" value="0" step="1" aria-label="视频帧进度">
               </div>
               <div class="rv-ctrl__right">
                 <span class="rv-loadstate" id="rv-load-state" hidden></span>
@@ -1039,6 +1085,19 @@ Date November 2026
                     id="set-vlm" aria-labelledby="set-vlm-name" aria-describedby="set-vlm-desc"
                     disabled aria-disabled="true"></button>
           </li>
+
+          <li class="set-row" id="set-agent-pairing-row" hidden>
+            <div class="set-row__main">
+              <p class="set-row__name" id="set-agent-pairing-name">重置令牌</p>
+              <p class="set-row__desc" id="set-agent-pairing-desc">
+                清除采集端和服务端的配对信息
+              </p>
+            </div>
+            <button class="btn btn--danger btn--sm" type="button"
+                    id="set-agent-pairing-reset" aria-labelledby="set-agent-pairing-name">
+              重置令牌
+            </button>
+          </li>
         </ul>
       </article>
 
@@ -1066,9 +1125,9 @@ Date November 2026
 
 <script src="assets/js/api.js?v=1794829243"></script>
 <script src="assets/js/bridge.js?v=1794829243"></script>
-<script src="assets/js/capture.js?v=1794830303"></script>
-<script src="assets/js/review.js?v=1794301279"></script>
+<script src="assets/js/capture.js?v=1794830303-font"></script>
+<script src="assets/js/review.js?v=1794301279-font-wheelfix"></script>
 <script src="assets/js/manage.js?v=1794301279"></script>
-<script src="assets/js/app.js?v=1794301279"></script>
+<script src="assets/js/app.js?v=1794301279-font"></script>
 </body>
 </html>

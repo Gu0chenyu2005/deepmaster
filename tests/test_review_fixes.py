@@ -1,0 +1,159 @@
+"""控制互斥、配置脱敏及代理错误回归。"""
+import io
+import json
+from pathlib import Path
+import sys
+import tempfile
+import threading
+import unittest
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'server'))
+import agent
+import cam
+import runner
+with patch.object(sys, 'argv', ['api.py']):
+    import api
+    import run_web
+
+
+class ReviewFixTests(unittest.TestCase):
+    def test_review_data_resolution_stays_inside_configured_dataset_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / 'project'
+            datasets = project / 'datasets'
+            sibling = project / 'other-version' / 'datasets'
+            (datasets / 'current').mkdir(parents=True)
+            sibling.mkdir(parents=True)
+            (datasets / 'outside-link').symlink_to(sibling, target_is_directory=True)
+            outside_episode = sibling / 'episode_1_vla_valid.hdf5'
+            outside_episode.write_bytes(b'outside')
+            (datasets / 'episode_1_vla_valid.hdf5').symlink_to(outside_episode)
+            with patch.object(api, 'INIT_DATA', str(datasets)), \
+                 patch.object(api, 'PROJECT_DIR', str(project)):
+                self.assertEqual(api.resolve_dir('datasets/current'),
+                                 str(datasets / 'current'))
+                self.assertIsNone(api.resolve_dir(str(sibling)))
+                self.assertIsNone(api.resolve_dir('datasets/outside-link'))
+                self.assertEqual(api.list_episode_files(str(datasets)), [])
+
+    def test_concurrent_control_is_rejected_and_lock_is_released(self):
+        entered, release = threading.Event(), threading.Event()
+
+        @runner.serialized_operation
+        def operation():
+            entered.set()
+            release.wait(3)
+            return {'ok': True}
+
+        thread = threading.Thread(target=operation)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            self.assertFalse(operation()['ok'])
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertTrue(operation()['ok'])
+
+    def test_missing_direct_camera_keeps_old_preview(self):
+        result = Mock(returncode=0, stdout='2\n', stderr='')
+        with patch.object(agent.os.path, 'exists', return_value=True), \
+             patch.object(runner, '_alive', return_value=False), \
+             patch.object(agent, '_direct_camera_command', side_effect=lambda x: x), \
+             patch.object(agent.subprocess, 'run', return_value=result), \
+             patch.object(runner, 'stop') as stop, \
+             patch.object(runner, 'spawn') as spawn:
+            self.assertFalse(agent.start_cam_viewer('direct')['ok'])
+        stop.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_live_preview_is_reused(self):
+        with patch.dict(agent.STATE, cam_mode='direct'), \
+             patch.object(agent.os.path, 'exists', return_value=True), \
+             patch.object(runner, '_alive', return_value=True), \
+             patch.object(runner, 'spawn') as spawn:
+            result = agent.start_cam_viewer('direct')
+        self.assertTrue(result['already'])
+        spawn.assert_not_called()
+
+    def test_stop_failure_preserves_process_ownership(self):
+        process = Mock(pid=123)
+        process.poll.return_value = None
+        entry = {'proc': process}
+        with patch.dict(runner._procs, test_stubborn=entry), \
+             patch.object(runner.os, 'getpgid', return_value=123), \
+             patch.object(runner.os, 'killpg'), \
+             patch.object(runner.time, 'sleep'):
+            self.assertFalse(runner.stop('test_stubborn')['ok'])
+            self.assertIs(runner._procs['test_stubborn'], entry)
+
+    def test_config_save_response_has_no_credentials(self):
+        old = dict(agent.STATE)
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                agent.STATE.update(cfg={'agent_token': 'private', 'sudo_pw': 'secret',
+                                        'dds_password': 'secret'},
+                                   cfg_path=root + '/config.json')
+                result = agent.save_cfg({'local_data_dir': root})
+                for field in ('agent_token', 'sudo_pw', 'dds_password'):
+                    self.assertNotIn(field, result['config'])
+                self.assertTrue(result['config']['dds_password_set'])
+                self.assertEqual(agent.STATE['cfg']['agent_token'], 'private')
+        finally:
+            agent.STATE.update(old)
+
+    def test_unmanaged_control_is_not_reported_stopped(self):
+        with patch.object(runner, '_alive', return_value=False), \
+             patch.object(runner, 'pgrep_count', return_value=1), \
+             patch.object(runner, 'stop') as stop:
+            self.assertFalse(runner.stop_control_only({})['ok'])
+        stop.assert_not_called()
+
+    def test_config_get_requires_login(self):
+        handler = object.__new__(api.Handler)
+        handler._user = Mock(side_effect=PermissionError('login required'))
+        with patch.object(api, 'op_config_get') as read:
+            with self.assertRaises(PermissionError):
+                handler._route_get(['config'], {})
+        read.assert_not_called()
+
+    def test_camera_proxy_requires_login(self):
+        handler = object.__new__(api.Handler)
+        handler._user = Mock(side_effect=PermissionError('login required'))
+        with patch.object(handler, '_cam') as camera:
+            with self.assertRaises(PermissionError):
+                handler._route_get(['cam', 'health'], {})
+        camera.assert_not_called()
+
+    def test_direct_camera_fps_mapping(self):
+        segment = {'label': 'primary', 'present': True,
+                   'measured_fps': 28.5, 'source_fps': 30}
+        with patch.object(cam, 'upstream_health', return_value={'segments': [segment]}):
+            status = cam.health()['cams']['wrist']
+        self.assertEqual(status['fps'], 28.5)
+        self.assertEqual(status['source_fps'], 30)
+
+    def test_proxy_errors_are_json_and_control_timeout_is_long_enough(self):
+        for session in (None, Mock()):
+            handler = object.__new__(run_web.H)
+            handler.path = '/api/run/t1'
+            handler.headers = {}
+            handler.rfile = io.BytesIO()
+            handler.wfile = io.BytesIO()
+            handler.send_response = Mock()
+            handler.send_header = Mock()
+            handler.end_headers = Mock()
+            failure = RuntimeError('quoted "error"\nnext line')
+            if session is not None:
+                session.request.side_effect = failure
+            with patch.object(run_web, '_SESSION', session), \
+                 patch.object(run_web, 'urlopen', side_effect=failure) as request:
+                handler._proxy('POST')
+            self.assertEqual(json.loads(handler.wfile.getvalue())['message'], str(failure))
+            request = session.request if session is not None else request
+            self.assertEqual(request.call_args.kwargs['timeout'], 150)
+
+
+if __name__ == '__main__':
+    unittest.main()

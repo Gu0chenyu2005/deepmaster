@@ -330,7 +330,10 @@ Date November 2026
     z: function () { return Promise.resolve(bridgeMissing("z")); },
     stop: function () { return Promise.resolve(bridgeMissing("stop")); },
     captureStop: function () { return Promise.resolve(bridgeMissing("capture-stop")); },
+    controlStop: function () { return Promise.resolve(bridgeMissing("control-stop")); },
     camStart: function () { return Promise.resolve(bridgeMissing("cam-start")); },
+    camStop: function () { return Promise.resolve(bridgeMissing("cam-stop")); },
+    camHealth: function () { return Promise.resolve(null); },
     latestDir: function () { return Promise.resolve({ ok: false, name: null }); }
   };
 
@@ -376,6 +379,42 @@ Date November 2026
   }
 
   var running = false;
+  var CAP_MODE_KEY = "dm.capture.mode";
+  var captureMode = "near";
+  var controlOnlyActive = false;
+  var controlStartGeneration = 0;
+  var controlDeployStarted = false;
+  try {
+    var savedCaptureMode = sessionStorage.getItem(CAP_MODE_KEY);
+    if (["remote", "control"].indexOf(savedCaptureMode) >= 0) { captureMode = savedCaptureMode; }
+  } catch (e) {}
+
+  function renderCaptureMode() {
+    var modeSwitch = $("#cap-mode-switch");
+    if (modeSwitch) { modeSwitch.dataset.mode = captureMode; }
+    $$('[data-capture-mode]').forEach(function (button) {
+      button.setAttribute("aria-pressed", button.dataset.captureMode === captureMode ? "true" : "false");
+      button.disabled = running;
+    });
+    var label = $("#cap-mode-label");
+    if (label) {
+      label.textContent = captureMode === "control" ? "远控仅控制" :
+        captureMode === "remote" ? "远控模式" : "近控模式";
+    }
+    var startButton = $("#btn-new-task");
+    if (startButton) { startButton.textContent = captureMode === "control" ? "进入控制" : "开始采集"; }
+  }
+
+  $$("[data-capture-mode]").forEach(function (button) {
+    button.addEventListener("click", function () {
+      if (running) { return; }
+      captureMode = button.dataset.captureMode === "control" ? "control" :
+        button.dataset.captureMode === "remote" ? "remote" : "near";
+      try { sessionStorage.setItem(CAP_MODE_KEY, captureMode); } catch (e) {}
+      renderCaptureMode();
+    });
+  });
+  renderCaptureMode();
 
   function renderTasks() {
      
@@ -424,7 +463,149 @@ Date November 2026
             toast("这台机器狗的采集端没有程序配置（host_config.json 缺失），请检查采集端端安装");
             return;
           }
-          startCaptureSession("", cfg);    
+          if (captureMode === "control") { startControlOnly(cfg); }
+          else { startCaptureSession("", cfg); }
+        });
+      });
+    });
+  }
+
+  function waitForDirectCameras(cfg, attempts) {
+    return br().camHealth(cfg).then(function (health) {
+      var cams = health && health.cams;
+      var ready = cams && CAM_KEYS.every(function (key) {
+        return cams[key] && cams[key].online;
+      });
+      if (ready) { return health; }
+      if (attempts <= 0) {
+        var details = cams ? CAM_KEYS.map(function (key) {
+          var cam = cams[key];
+          return cam && !cam.online ? key + ": " + (cam.error || "未就绪") : "";
+        }).filter(Boolean).join("；") : "采集端相机服务不可达";
+        throw new Error("采集端直连三相机未全部就绪：" + details);
+      }
+      return new Promise(function (resolve) {
+        setTimeout(resolve, 1000);
+      }).then(function () { return waitForDirectCameras(cfg, attempts - 1); });
+    });
+  }
+
+  function startControlOnly(cfg) {
+    openModal({
+      title: "进入远控仅控制模式？",
+      html: "<p>该模式不创建采集会话，请确认机械臂周围安全。</p>",
+      ok: "进入控制", cancel: "取消", danger: true
+    }).then(function (confirmed) {
+      if (!confirmed || running) { return; }
+      running = true;
+      var generation = ++controlStartGeneration;
+      controlOnlyActive = true;
+      controlDeployStarted = false;
+      var controlCameraStarted = false;
+      activeSession = null;
+      sessionFolder = null;
+      cfgForRetry = cfg;
+      timerStart = 0;
+      showLive(null);
+      var title = $("#t-capture-live");
+      if (title) { title.textContent = "远程控制"; }
+      var dir = $("#cap-dir");
+      if (dir) { dir.hidden = true; }
+      var clock = $("#cap-clock");
+      if (clock) { clock.hidden = true; }
+      var exit = $("#cap-exit");
+      if (exit) { exit.textContent = "退出控制"; }
+      var records = $("#cap-records-card");
+      if (records) { records.hidden = true; }
+
+      setPhase("busy", "启动直连相机");
+      Promise.resolve(br().camStart(cfg, logLine, "direct-webrtc")).then(function (camera) {
+        if (!camera || !camera.ok) { throw new Error((camera && camera.error) || "直连相机服务启动失败"); }
+        controlCameraStarted = !camera.already;
+        return waitForDirectCameras(cfg, 15);
+      }).then(function () {
+        if (!running) { throw new Error("控制模式已取消"); }
+        setPhase("busy", "等待三路视频就绪");
+        return fetchFramePreview(cfg);
+      }).then(function () {
+        if (!running || generation !== controlStartGeneration) {
+          throw new Error("__control_cancelled__");
+        }
+        setPhase("busy", "等待 K7 就绪");
+        return br().t1(cfg, logLine);
+      }).then(function (k7) {
+        if (!running || generation !== controlStartGeneration) { throw new Error("__control_cancelled__"); }
+        if (!k7 || !k7.ok) { throw new Error((k7 && k7.error) || "K7Master3 未就绪"); }
+        setPhase("busy", "启动远控程序");
+        return br().t2(cfg, logLine, true);
+      }).then(function (deploy) {
+        if (!deploy || !deploy.ok) { throw new Error((deploy && deploy.error) || "远控程序启动失败"); }
+        controlDeployStarted = true;
+        if (!running || generation !== controlStartGeneration) {
+          return br().controlStop(cfg, logLine).then(function (stopped) {
+            if (!stopped || !stopped.ok) {
+              throw new Error((stopped && stopped.error) || "退出期间清理远控程序失败");
+            }
+            throw new Error("__control_cancelled__");
+          });
+        }
+        return br().z(cfg, logLine);
+      }).then(function (result) {
+        if (result && result.ok === false) { throw new Error(result.error || "远控启动指令失败"); }
+        if (!running || generation !== controlStartGeneration) {
+          return br().controlStop(cfg, logLine).then(function (stopped) {
+            if (!stopped || !stopped.ok) {
+              throw new Error((stopped && stopped.error) || "退出期间清理远控程序失败");
+            }
+          });
+        }
+        if (!running) { return; }
+        setPhase("run", "仅控制中");
+      }).catch(function (error) {
+        if (!running) {
+          var cleanup = controlDeployStarted
+            ? br().controlStop(cfg, logLine)
+            : (controlCameraStarted ? br().camStop(cfg, logLine) : Promise.resolve({ ok: true }));
+          Promise.resolve(cleanup).then(function (stopped) {
+            if (!stopped || !stopped.ok) {
+              setPhase("error", "退出控制清理失败");
+              toast("退出控制时清理远控程序失败：" +
+                ((stopped && stopped.error) || (error && error.message) || "未知错误"));
+            }
+          }).catch(function (cleanupError) {
+            setPhase("error", "退出控制清理失败");
+            toast("退出控制时清理远控程序失败：" + (cleanupError.message || cleanupError));
+          });
+          return;
+        }
+        running = false;
+        stopFramePreview();
+        setPhase("error", "控制启动失败");
+        if (controlDeployStarted) {
+          br().controlStop(cfg, logLine).catch(function () {});
+        } else if (controlCameraStarted) {
+          br().camStop(cfg, logLine).catch(function () {});
+        }
+        openModal({
+          title: "远控启动失败",
+          html: "<p>" + esc(error.message || error) + "</p>",
+          ok: "知道了", noCancel: true
+        }).then(function () {
+          controlOnlyActive = false;
+          controlDeployStarted = false;
+          renderCaptureMode();
+          activeSession = null;
+          cfgForRetry = null;
+          var records = $("#cap-records-card");
+          if (records) { records.hidden = true; }
+          lastFoldersSignature = null;
+          lastFolders = [];
+          loadFolders();
+          if (title) { title.textContent = "采集"; }
+          if (dir) { dir.hidden = false; }
+          if (clock) { clock.hidden = false; }
+          if (exit) { exit.textContent = "退出采集"; }
+          hideLive();
         });
       });
     });
@@ -437,6 +618,7 @@ Date November 2026
   }
 
   function startCaptureSession(folder, cfg) {
+    if (controlOnlyActive) { toast("仅控制模式已关闭采集功能"); return; }
     var base = dataDir(cfg);
 
     if (!window.dmApi) { toast("接口模块未加载"); return; }
@@ -475,6 +657,7 @@ Date November 2026
   }
 
   function doStart(base, folder, pre) {
+    if (controlOnlyActive) { toast("仅控制模式已关闭采集功能"); return Promise.resolve(null); }
     return window.dmApi.startSession(base, folder).then(function (s) {
       if (s.resumed) {
         return window.dmApi.runStatus().then(function (status) {
@@ -533,7 +716,8 @@ Date November 2026
         ? (session.collectorPath || session.dirPath || "") : "";
     }
     setPhase("idle", "准备中");
-    refreshRecords();
+    renderCaptureMode();
+    if (!controlOnlyActive) { refreshRecords(); }
   }
 
   function hideLive() {
@@ -549,6 +733,27 @@ Date November 2026
   var previewGeneration = 0;
   var previewControllers = {};
   var previewUrls = {};
+  var REMOTE_PROFILES = ["remote", "remote_low", "remote_min"];
+  var CONTROL_PROFILES = ["control", "control_low", "control_min"];
+  var remoteProfileIndex = 0;
+  var remoteFrameTimes = { wrist: [], global: [], third: [] };
+  var remoteSourceFps = { wrist: 0, global: 0, third: 0 };
+  var remoteReconnectAttempts = { wrist: 0, global: 0, third: 0 };
+  var remoteStreamStarted = { wrist: 0, global: 0, third: 0 };
+  var remoteReconnectTimers = {};
+  var remoteWatchTimer = null;
+  var remoteAdaptTimer = null;
+  var remoteHealthySince = 0;
+  var remoteSlowSince = 0;
+  var remoteProfileChangedAt = 0;
+  var remoteRenderers = {};
+  var remoteReceivedAt = { wrist: 0, global: 0, third: 0 };
+  var remoteStatusUpdatedAt = 0;
+  var controlPeer = null;
+  var controlPeerSession = "";
+  var controlVideoEls = {};
+  var controlReconnectTimer = null;
+  var controlReconnectAttempts = 0;
 
   var camHadFrame = { wrist: false, global: false, third: false };
 
@@ -560,11 +765,11 @@ Date November 2026
     var phText = ph ? ph.querySelector("p") : null;
 
     if (src) {
-      img.src = src;
-      img.hidden = false;
-      if (ph) { ph.hidden = true; }
+      if (img.getAttribute("src") !== src) { img.src = src; }
+      if (img.hidden) { img.hidden = false; }
+      if (ph && !ph.hidden) { ph.hidden = true; }
       camHadFrame[cam] = true;
-      if (panel) { panel.classList.remove("is-lost"); }
+      if (panel && panel.classList.contains("is-lost")) { panel.classList.remove("is-lost"); }
     } else {
       img.removeAttribute("src");
       img.hidden = true;
@@ -580,16 +785,508 @@ Date November 2026
     }
   }
 
+  function createMjpegParser() {
+    var header = new Uint8Array(2048);
+    var headerLength = 0;
+    var bodyLength = 0;
+    var body = null;
+    var bodyOffset = 0;
+    var frameSeq = null;
+    var frameTime = null;
+    var invalid = false;
+    return {
+      push: function (bytes) {
+        var latest = null;
+        var latestSeq = null;
+        var latestTime = null;
+        var offset = 0;
+        while (!invalid && offset < bytes.length) {
+          if (!bodyLength) {
+            if (headerLength === header.length) { invalid = true; break; }
+            header[headerLength++] = bytes[offset++];
+            var n = headerLength;
+            if (n < 4 || header[n - 4] !== 13 || header[n - 3] !== 10 ||
+                header[n - 2] !== 13 || header[n - 1] !== 10) { continue; }
+            var text = String.fromCharCode.apply(null, header.subarray(0, n - 4));
+            var match = /(?:^|\r\n)Content-Length:\s*(\d+)\s*(?:\r\n|$)/i.exec(text);
+            bodyLength = match ? Number(match[1]) : 0;
+            if (!Number.isSafeInteger(bodyLength) || bodyLength <= 0 || bodyLength > 8 * 1024 * 1024) {
+              invalid = true; break;
+            }
+            var seq = /(?:^|\r\n)X-Frame-Seq:\s*(\d+)\s*(?:\r\n|$)/i.exec(text);
+            var captured = /(?:^|\r\n)X-Capture-Time:\s*(\d+(?:\.\d+)?)\s*(?:\r\n|$)/i.exec(text);
+            frameSeq = seq && Number.isSafeInteger(Number(seq[1])) ? Number(seq[1]) : null;
+            frameTime = captured && Number.isFinite(Number(captured[1])) ? Number(captured[1]) : null;
+            headerLength = 0;
+            continue;
+          }
+          var available = Math.min(bodyLength - bodyOffset, bytes.length - offset);
+          if (!body && available === bodyLength) {
+            latest = bytes.subarray(offset, offset + available);
+          } else {
+            if (!body) { body = new Uint8Array(bodyLength); }
+            body.set(bytes.subarray(offset, offset + available), bodyOffset);
+          }
+          bodyOffset += available;
+          offset += available;
+          if (bodyOffset === bodyLength) {
+            if (body) { latest = body; }
+            latestSeq = frameSeq;
+            latestTime = frameTime;
+            body = null;
+            bodyLength = 0;
+            bodyOffset = 0;
+          }
+        }
+        return { frame: latest, seq: latestSeq, capturedAt: latestTime, invalid: invalid };
+      }
+    };
+  }
+
+  function createFrameDelayTracker() {
+    var minimumOffset = Infinity;
+    var previousCapture = 0;
+    var delayedSince = 0;
+    var delayedFrames = 0;
+    return {
+      late: function (capturedAt, receivedAt) {
+        if (!Number.isFinite(capturedAt) || capturedAt <= 0) { return false; }
+        var offset = receivedAt - capturedAt;
+        if (capturedAt < previousCapture) { minimumOffset = offset; }
+        previousCapture = capturedAt;
+        minimumOffset = Math.min(minimumOffset, offset);
+        if (offset - minimumOffset < 800) {
+          delayedSince = 0;
+          delayedFrames = 0;
+          return false;
+        }
+        if (!delayedFrames) { delayedSince = receivedAt; }
+        delayedFrames++;
+        return delayedFrames >= 3 && receivedAt - delayedSince >= 1000;
+      }
+    };
+  }
+
+  function setRemoteStatus(text, warning) {
+    var box = $("#cap-preview-health");
+    var label = $("#cap-preview-status");
+    if (box) {
+      if (box.hidden) { box.hidden = false; }
+      if (box.classList.contains("is-warning") !== !!warning) {
+        box.classList.toggle("is-warning", !!warning);
+      }
+    }
+    if (label && label.textContent !== text) { label.textContent = text; }
+  }
+
+  function remoteRate(cam, now) {
+    var times = remoteFrameTimes[cam];
+    while (times.length && now - times[0] > 2000) { times.shift(); }
+    if (times.length < 2 || times[times.length - 1] === times[0]) { return 0; }
+    return Math.round((times.length - 1) * 1000 / (times[times.length - 1] - times[0]));
+  }
+
+  var controlMetricTimer = null;
+  var controlMetrics = {};
+  var controlHistory = [];
+  var controlColors = ["#1683ff", "#19a974", "#e89016"];
+  var controlNames = { wrist: "腕", global: "头", third: "第三" };
+
+  function controlNow() {
+    return window.performance && window.performance.now
+      ? window.performance.now() : Date.now();
+  }
+
+  function watchControlFrames(cam, video, generation) {
+    if (typeof video.requestVideoFrameCallback !== "function") {
+      controlMetrics[cam] = { unsupported: true, previous: null, lastFrame: null,
+        latency: [], intervals: [], frames: 0, sampledAt: controlNow(), callback: null };
+      return;
+    }
+    var state = { unsupported: false, captureTimeSeen: false, previous: null, lastFrame: null, latency: [], intervals: [], frames: 0,
+      sampledAt: controlNow(), callback: null };
+    controlMetrics[cam] = state;
+    function onFrame(now, metadata) {
+      if (generation !== previewGeneration || controlMetrics[cam] !== state) { return; }
+      var shownAt = metadata.expectedDisplayTime;
+      if (Number.isFinite(shownAt) && (state.previous === null || shownAt > state.previous)) {
+        if (state.previous !== null) { state.intervals.push(shownAt - state.previous); }
+        state.previous = shownAt;
+        state.lastFrame = now;
+        state.frames++;
+        var delay = shownAt - metadata.captureTime;
+        if (Number.isFinite(metadata.captureTime)) {
+          state.captureTimeSeen = true;
+          if (Number.isFinite(delay) && delay >= 0) { state.latency.push(delay); }
+        }
+      }
+      state.callback = video.requestVideoFrameCallback(onFrame);
+    }
+    state.callback = video.requestVideoFrameCallback(onFrame);
+  }
+
+  function drawControlMetric(id, index, minimum, step, unit) {
+    var canvas = $("#cap-" + id + "-chart");
+    if (!canvas || !canvas.clientWidth) { return; }
+    var width = canvas.clientWidth;
+    var height = canvas.clientHeight;
+    var scale = Math.min(window.devicePixelRatio || 1, 2);
+    var w = Math.round(width * scale), h = Math.round(height * scale);
+    if (canvas.width !== w) { canvas.width = w; }
+    if (canvas.height !== h) { canvas.height = h; }
+    var ctx = canvas.getContext("2d");
+    if (!ctx) { return; }
+    ctx.setTransform(scale, 0, 0, scale, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    var top = 9, bottom = height - 13;
+    var max = minimum;
+    controlHistory.forEach(function (point) {
+      CAM_KEYS.forEach(function (cam) { max = Math.max(max, point[cam][index] || 0); });
+    });
+    max = Math.ceil(max / step) * step;
+    ctx.strokeStyle = "rgba(100, 116, 139, .16)";
+    ctx.lineWidth = 1;
+    [top, (top + bottom) / 2, bottom].forEach(function (y) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
+    });
+    ctx.font = "9px " + getComputedStyle(canvas).fontFamily;
+    ctx.fillStyle = "#505765";
+    ctx.fillText(max + " " + unit, 2, 8);
+    ctx.fillText("60 秒前", 2, height - 1);
+    ctx.textAlign = "right";
+    ctx.fillText("现在", width - 2, height - 1);
+    ctx.textAlign = "left";
+    var latest = controlHistory[controlHistory.length - 1];
+    CAM_KEYS.forEach(function (cam, i) {
+      ctx.strokeStyle = controlColors[i];
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      var drawing = false;
+      controlHistory.forEach(function (point) {
+        var value = point[cam][index];
+        if (value === null) { drawing = false; return; }
+        var x = width * (1 - (latest.at - point.at) / 60000);
+        var y = bottom - value / max * (bottom - top);
+        if (drawing) { ctx.lineTo(x, y); }
+        else { ctx.moveTo(x, y); ctx.lineTo(x + 0.1, y); drawing = true; }
+      });
+      ctx.stroke();
+    });
+    var output = $("#cap-" + id + "-value");
+    var values = CAM_KEYS.map(function (cam) {
+      var value = latest[cam][index];
+      return controlNames[cam] + " " + (value === null ? "—" : Math.round(value));
+    });
+    if (output) {
+      output.textContent = values.every(function (v) { return /—$/.test(v); })
+        ? "暂无数据" : values.join(" · ") + " " + unit;
+    }
+  }
+
+  function sampleControlMetrics() {
+    if (document.hidden || !running || captureMode !== "control") { return; }
+    var now = controlNow();
+    var point = { at: now };
+    var unsupported = 0;
+    var captureTimes = 0;
+    var activeFrames = 0;
+    CAM_KEYS.forEach(function (cam) {
+      var state = controlMetrics[cam];
+      if (!state) { point[cam] = [null, null, null]; return; }
+      if (state.unsupported) {
+        unsupported++;
+        point[cam] = [null, null, null];
+        return;
+      }
+      var elapsed = now - state.sampledAt;
+      var stale = state.lastFrame === null || now - state.lastFrame > 2000 || elapsed > 2500;
+      if (!stale) { activeFrames++; }
+      if (state.captureTimeSeen) { captureTimes++; }
+      var average = function (samples) {
+        return !stale && samples.length
+          ? samples.reduce(function (sum, value) { return sum + value; }, 0) / samples.length : null;
+      };
+      var fps = !stale && elapsed > 0 ? state.frames * 1000 / elapsed : 0;
+      point[cam] = [average(state.latency), average(state.intervals), fps];
+      state.frames = 0;
+      state.latency = [];
+      state.intervals = [];
+      state.sampledAt = now;
+      var label = $('[data-cam-fps="' + cam + '"]');
+      if (label) { label.textContent = Math.round(fps) + " FPS"; }
+    });
+    controlHistory.push(point);
+    while (now - controlHistory[0].at > 60000) { controlHistory.shift(); }
+    drawControlMetric("e2e", 0, 100, 50, "ms");
+    drawControlMetric("interval", 1, 50, 25, "ms");
+    drawControlMetric("fps", 2, 30, 15, "FPS");
+    var e2eOutput = $("#cap-e2e-value");
+    if (e2eOutput && captureTimes === 0) {
+      e2eOutput.textContent = unsupported === CAM_KEYS.length
+        ? "浏览器不支持逐帧测量"
+        : (activeFrames ? "浏览器未提供采集时间戳" : "等待视频帧");
+    }
+  }
+
+  function startControlLatency() {
+    var panel = $("#cap-latency");
+    if (panel) { panel.hidden = false; }
+    controlHistory = [];
+    controlMetrics = {};
+    sampleControlMetrics();
+    controlMetricTimer = setInterval(sampleControlMetrics, 1000);
+  }
+
+  function clearRemoteRenderers(cam) {
+    var keys = cam ? [cam] : Object.keys(remoteRenderers);
+    keys.forEach(function (key) {
+      var state = remoteRenderers[key];
+      if (!state) { return; }
+      state.pending = null;
+      state.img.onload = null;
+      state.img.onerror = null;
+      if (state.animation && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(state.animation);
+      }
+      if (state.previous) { URL.revokeObjectURL(state.previous); }
+      delete remoteRenderers[key];
+    });
+  }
+
+  function showRemoteFrame(cam, bytes, generation) {
+    if (!running || generation !== previewGeneration) { return; }
+    remoteReceivedAt[cam] = Date.now();
+    remoteReconnectAttempts[cam] = 0;
+    var state = remoteRenderers[cam];
+    if (!state) {
+      var img = $("#cap-img-" + cam);
+      if (!img) { return; }
+      state = { img: img, pending: null, busy: false, previous: null, animation: null, uiAt: 0 };
+      remoteRenderers[cam] = state;
+    }
+    state.pending = bytes;
+    if (state.busy) { return; }
+    function current() {
+      return running && generation === previewGeneration && remoteRenderers[cam] === state;
+    }
+    function paint() {
+      state.animation = null;
+      if (!current()) { return; }
+      var latest = state.pending;
+      state.pending = null;
+      if (!latest) { state.busy = false; return; }
+      state.busy = true;
+      state.decodeAt = Date.now();
+      var url = URL.createObjectURL(new Blob([latest], { type: "image/jpeg" }));
+      state.previous = previewUrls[cam] || null;
+      previewUrls[cam] = url;
+      function finished(loaded) {
+        if (!current() || previewUrls[cam] !== url) { return; }
+        if (state.previous) { URL.revokeObjectURL(state.previous); state.previous = null; }
+        if (loaded) {
+          var now = Date.now();
+          remoteFrameTimes[cam].push(now);
+          setCamFrame(cam, url);
+          if (now - state.uiAt >= 500) {
+            state.uiAt = now;
+            var fps = remoteRate(cam, now);
+            var label = $("[data-cam-fps=\"" + cam + "\"]");
+            var text = fps ? fps + " FPS" : "正在取流";
+            if (label && label.textContent !== text) { label.textContent = text; }
+          }
+          if (now - remoteStatusUpdatedAt >= 500) {
+            remoteStatusUpdatedAt = now;
+            var healthy = CAM_KEYS.every(function (key) {
+              return now - (remoteFrameTimes[key].slice(-1)[0] || 0) < 2000;
+            });
+            if (healthy) { setRemoteStatus("三路画面已连接", false); }
+          }
+        }
+        state.img.onload = null;
+        state.img.onerror = null;
+        if (state.pending && typeof window.requestAnimationFrame === "function") {
+          state.animation = window.requestAnimationFrame(paint);
+        } else {
+          state.busy = false;
+          if (state.pending) { paint(); }
+        }
+      }
+      state.img.onload = function () { finished(true); };
+      state.img.onerror = function () { finished(false); };
+      state.img.src = url;
+    }
+    paint();
+  }
+
+  function scheduleRemoteReconnect(cam, cfg, generation) {
+    if (!running || generation !== previewGeneration || remoteReconnectTimers[cam]) { return; }
+    var attempt = remoteReconnectAttempts[cam]++;
+    var delay = Math.min(8000, 500 * Math.pow(2, Math.min(attempt, 4)));
+    setRemoteStatus("画面连接中断，正在重连", true);
+    remoteReconnectTimers[cam] = setTimeout(function () {
+      delete remoteReconnectTimers[cam];
+      if (running && generation === previewGeneration) { runRemoteStream(cam, cfg, generation); }
+    }, delay);
+  }
+
+  function runRemoteStream(cam, cfg, generation) {
+    if (!running || generation !== previewGeneration) { return; }
+    var bridge = window.dmBridge;
+    var controller = new AbortController();
+    previewControllers[cam] = controller;
+    remoteStreamStarted[cam] = Date.now();
+    var parser = createMjpegParser();
+    var delayTracker = createFrameDelayTracker();
+    var lastSeq = null;
+    Promise.resolve().then(function () {
+      if (!running || generation !== previewGeneration || controller.signal.aborted) { return null; }
+      var profiles = captureMode === "control" ? CONTROL_PROFILES : REMOTE_PROFILES;
+      var profile = profiles[remoteProfileIndex];
+      return fetch(bridge.streamUrl(cfg, cam, profile), {
+        cache: "no-store", credentials: "omit", mode: "cors", signal: controller.signal
+      });
+    }).then(function (response) {
+      if (!running || generation !== previewGeneration || controller.signal.aborted) { return; }
+      if (!response.ok || !response.body || !response.body.getReader) {
+        throw new Error("远控视频流不可用");
+      }
+      var reader = response.body.getReader();
+      function read() {
+        return reader.read().then(function (part) {
+          if (part.done || !running || generation !== previewGeneration) { throw new Error("视频流已关闭"); }
+          var parsed = parser.push(part.value);
+          if (parsed.invalid) { throw new Error("视频流格式错误"); }
+          if (parsed.frame) {
+            var receivedAt = window.performance && typeof window.performance.now === "function"
+              ? window.performance.now() : Date.now();
+            if (!document.hidden && delayTracker.late(parsed.capturedAt, receivedAt)) {
+              var profiles = captureMode === "control" ? CONTROL_PROFILES : REMOTE_PROFILES;
+              if (remoteProfileIndex < profiles.length - 1) {
+                remoteProfileIndex++;
+                remoteProfileChangedAt = Date.now();
+                remoteSlowSince = 0;
+                remoteHealthySince = 0;
+                setRemoteStatus("检测到视频积压，正在降低码率并恢复实时画面", true);
+                restartRemoteStreams(cfg);
+                return;
+              }
+              throw new Error("视频流积压");
+            }
+            if (parsed.seq === null || parsed.seq !== lastSeq) {
+              lastSeq = parsed.seq;
+              showRemoteFrame(cam, parsed.frame, generation);
+            }
+          }
+          return read();
+        });
+      }
+      return read();
+    }).catch(function () {
+      var retry = !controller.signal.aborted && running && generation === previewGeneration;
+      controller.abort();
+      if (retry) { scheduleRemoteReconnect(cam, cfg, generation); }
+    }).then(function () {
+      if (previewControllers[cam] === controller) { delete previewControllers[cam]; }
+    });
+  }
+
+  function restartRemoteStreams(cfg) {
+    previewGeneration++;
+    var generation = previewGeneration;
+    clearRemoteRenderers();
+    Object.keys(previewControllers).forEach(function (cam) {
+      try { previewControllers[cam].abort(); } catch (e) {}
+    });
+    previewControllers = {};
+    Object.keys(remoteReconnectTimers).forEach(function (cam) {
+      clearTimeout(remoteReconnectTimers[cam]);
+      delete remoteReconnectTimers[cam];
+    });
+    CAM_KEYS.forEach(function (cam) {
+      remoteFrameTimes[cam] = [];
+      remoteReceivedAt[cam] = 0;
+      remoteReconnectAttempts[cam] = 0;
+      runRemoteStream(cam, cfg, generation);
+    });
+  }
+
+  function startRemoteAdaptation(cfg) {
+    if (remoteWatchTimer) { clearInterval(remoteWatchTimer); }
+    if (remoteAdaptTimer) { clearInterval(remoteAdaptTimer); }
+    remoteWatchTimer = setInterval(function () {
+      var now = Date.now();
+      var stale = false;
+      CAM_KEYS.forEach(function (cam) {
+        var last = remoteReceivedAt[cam];
+        var timedOut = last ? now - last > 2200 : now - remoteStreamStarted[cam] > 5000;
+        var renderer = remoteRenderers[cam];
+        if (!document.hidden && renderer && renderer.busy && !renderer.animation && now - renderer.decodeAt > 2500) {
+          clearRemoteRenderers(cam);
+          timedOut = true;
+        }
+        if (timedOut && previewControllers[cam] && !previewControllers[cam].signal.aborted) {
+          previewControllers[cam].abort();
+          scheduleRemoteReconnect(cam, cfg, previewGeneration);
+          stale = true;
+        }
+        if (!last || now - last > 2200) { stale = true; }
+      });
+      if (stale) { setRemoteStatus("视频链路不稳定，正在恢复画面", true); }
+    }, 500);
+    remoteAdaptTimer = setInterval(function () {
+      var rates = CAM_KEYS.map(function (cam) { return remoteRate(cam, Date.now()); });
+      var sources = CAM_KEYS.map(function (cam) { return remoteSourceFps[cam] || 0; });
+      var now = Date.now();
+      var profiles = captureMode === "control" ? CONTROL_PROFILES : REMOTE_PROFILES;
+      var targets = sources.map(function (fps) {
+        return captureMode === "control" ? fps : Math.min(fps, [30, 24, 18][remoteProfileIndex]);
+      });
+      var slow = CAM_KEYS.filter(function (cam, i) {
+        var times = remoteFrameTimes[cam];
+        var hasRecentSamples = times.length >= 2 && now - times[times.length - 1] < 1500;
+        return hasRecentSamples && targets[i] >= 15 && rates[i] < targets[i] * 0.82;
+      }).length;
+      if (slow && remoteProfileIndex < profiles.length - 1) {
+        remoteHealthySince = 0;
+        if (!remoteSlowSince) { remoteSlowSince = now; }
+        if (now - remoteSlowSince >= 4000 && now - remoteProfileChangedAt >= 10000) {
+          remoteSlowSince = 0;
+          remoteProfileChangedAt = now;
+          remoteProfileIndex++;
+          setRemoteStatus("正在降低预览码率，优先保持画面帧率", true);
+          restartRemoteStreams(cfg);
+        }
+      } else if (remoteProfileIndex > 0 && rates.every(function (rate, i) {
+        return targets[i] > 0 && rate >= targets[i] * 0.9;
+      })) {
+        remoteSlowSince = 0;
+        if (!remoteHealthySince) { remoteHealthySince = now; }
+        if (now - remoteHealthySince >= 20000) {
+          remoteHealthySince = 0;
+          remoteProfileChangedAt = now;
+          remoteProfileIndex--;
+          setRemoteStatus("网络稳定，正在恢复预览画质", false);
+          restartRemoteStreams(cfg);
+        }
+      } else {
+        remoteSlowSince = 0;
+        remoteHealthySince = 0;
+      }
+    }, 2000);
+  }
+
   function startCamWatchdog(cfg) {
     var check = function () {
       if (!running) { return; }
       var bridge = window.dmBridge;
       if (!bridge || typeof bridge.camHealth !== "function") { return; }
+      var generation = previewGeneration;
       Promise.resolve().then(function () { return bridge.camHealth(cfg); }).then(function (h) {
-        if (!running || !h || !h.cams) { return; }
+        if (!running || generation !== previewGeneration || !h || !h.cams) { return; }
         CAM_KEYS.forEach(function (cam) {
           var info = h.cams[cam];
           if (!info) { return; }
+          remoteSourceFps[cam] = Number(info.source_fps || info.fps || 0);
           if (!info.online) { setCamFrame(cam, null); return; }
           var img = $("#cap-img-" + cam);
            
@@ -603,11 +1300,236 @@ Date November 2026
     camHealthTimer = setInterval(check, 3000);
   }
 
+  function parseVideoMids(sdp) {
+    var result = {};
+    var sections = String(sdp || "").split(/(?=^m=)/m);
+    var index = 0;
+    sections.forEach(function (section) {
+      if (!/^m=video/m.test(section)) { return; }
+      var match = section.match(/^a=mid:(.+)$/m);
+      if (match && CAM_KEYS[index]) { result[match[1].trim()] = CAM_KEYS[index]; }
+      index++;
+    });
+    return result;
+  }
+
+  function clearControlVideos() {
+    Object.keys(controlVideoEls).forEach(function (cam) {
+      var video = controlVideoEls[cam];
+      var state = controlMetrics[cam];
+      delete controlMetrics[cam];
+      if (state && state.callback !== null && video.cancelVideoFrameCallback) {
+        video.cancelVideoFrameCallback(state.callback);
+      }
+      var fps = $('[data-cam-fps="' + cam + '"]');
+      if (fps) { fps.textContent = ""; }
+      try { video.pause(); video.srcObject = null; video.remove(); } catch (e) {}
+      var img = $("#cap-img-" + cam);
+      if (img) { img.hidden = false; }
+      var panel = img && img.closest(".cap-cam");
+      var placeholder = panel && panel.querySelector(".cap-cam__ph");
+      if (placeholder) { placeholder.hidden = false; }
+    });
+    controlVideoEls = {};
+  }
+
+  function closeControlPeer() {
+    var peer = controlPeer;
+    var sessionId = controlPeerSession;
+    controlPeer = null;
+    controlPeerSession = "";
+    if (peer) { try { peer.close(); } catch (e) {} }
+    clearControlVideos();
+    var bridge = window.dmBridge;
+    if (sessionId && bridge && bridge.webrtcClose) {
+      return Promise.resolve().then(function () {
+        return bridge.webrtcClose(sessionId);
+      }).catch(function () {});
+    }
+    return Promise.resolve();
+  }
+
+  function waitForIceGathering(peer, timeoutMs) {
+    if (peer.iceGatheringState === "complete") { return Promise.resolve(); }
+    return new Promise(function (resolve, reject) {
+      var timeout = setTimeout(function () {
+        peer.removeEventListener("icegatheringstatechange", changed);
+        reject(new Error("ICE 候选收集超时"));
+      }, timeoutMs);
+      function changed() {
+        if (peer.iceGatheringState !== "complete") { return; }
+        clearTimeout(timeout);
+        peer.removeEventListener("icegatheringstatechange", changed);
+        resolve();
+      }
+      peer.addEventListener("icegatheringstatechange", changed);
+    });
+  }
+
+  function waitForControlVideoFrames(generation, timeoutMs) {
+    return new Promise(function (resolve, reject) {
+      var deadline = Date.now() + timeoutMs;
+      var timer = setInterval(function () {
+        if (!running || generation !== previewGeneration) {
+          clearInterval(timer);
+          reject(new Error("控制模式已取消"));
+          return;
+        }
+        var ready = CAM_KEYS.every(function (cam) {
+          var video = controlVideoEls[cam];
+          return video && video.readyState >= 2 && video.videoWidth > 0;
+        });
+        if (ready) {
+          clearInterval(timer);
+          resolve(true);
+        } else if (Date.now() >= deadline) {
+          clearInterval(timer);
+          reject(new Error("等待三路 H.264 视频画面超时，未启动遥操程序"));
+        }
+      }, 100);
+    });
+  }
+
+  function scheduleControlReconnect(cfg, generation, grace) {
+    if (!running || captureMode !== "control" || generation !== previewGeneration || controlReconnectTimer) { return; }
+    var delay = Math.max(grace || 0, Math.min(8000, 500 * Math.pow(2, Math.min(controlReconnectAttempts++, 4))));
+    setRemoteStatus("H.264 视频连接中断，正在重连", true);
+    controlReconnectTimer = setTimeout(function () {
+      controlReconnectTimer = null;
+      if (!running || generation !== previewGeneration) { return; }
+      closeControlPeer().then(function () {
+        if (running && generation === previewGeneration) {
+          startControlWebRTC(cfg, generation);
+        }
+      });
+    }, delay);
+  }
+
+  function startControlWebRTC(cfg, generation) {
+    if (!running || captureMode !== "control" || generation !== previewGeneration) { return; }
+    if (!window.RTCPeerConnection) {
+      setRemoteStatus("当前浏览器不支持 WebRTC，请使用 Chrome 或 Edge", true);
+      return;
+    }
+    var bridge = window.dmBridge;
+    if (!bridge || !bridge.webrtcOffer) {
+      setRemoteStatus("服务端尚未提供 WebRTC 信令接口", true);
+      return;
+    }
+    var id = window.crypto && window.crypto.randomUUID
+      ? window.crypto.randomUUID() : "dm-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+    var peer = new RTCPeerConnection({ iceServers: [] });
+    controlPeer = peer;
+    controlPeerSession = id;
+    var midMap = {};
+    CAM_KEYS.forEach(function () {
+      var transceiver = peer.addTransceiver("video", { direction: "recvonly" });
+      if ("jitterBufferTarget" in transceiver.receiver) { transceiver.receiver.jitterBufferTarget = 0; }
+    });
+    peer.ontrack = function (event) {
+      var cam = midMap[event.transceiver && event.transceiver.mid];
+      if (!cam || !running || generation !== previewGeneration) { return; }
+      var img = $("#cap-img-" + cam);
+      var panel = img && img.closest(".cap-cam");
+      if (!img || !panel) { return; }
+      var video = controlVideoEls[cam];
+      if (!video) {
+        video = document.createElement("video");
+        video.className = "cap-control-video";
+        video.autoplay = true;
+        video.playsInline = true;
+        video.muted = true;
+        video.style.width = "100%";
+        video.style.height = "100%";
+        video.style.objectFit = "contain";
+        video.style.position = "absolute";
+        video.style.inset = "0";
+        video.style.display = "block";
+        img.parentElement.insertBefore(video, img.nextSibling);
+        controlVideoEls[cam] = video;
+      }
+      img.hidden = true;
+      var placeholder = panel.querySelector(".cap-cam__ph");
+      if (placeholder) { placeholder.hidden = true; }
+      video.srcObject = event.streams && event.streams[0]
+        ? event.streams[0] : new MediaStream([event.track]);
+      if (!controlMetrics[cam]) { watchControlFrames(cam, video, generation); }
+      video.play().catch(function () {});
+      remoteReceivedAt[cam] = Date.now();
+      setRemoteStatus("采集端 H.264 直连视频已连接", false);
+    };
+    peer.onconnectionstatechange = function () {
+      if (!running || generation !== previewGeneration) { return; }
+      if (peer.connectionState === "connected") {
+        if (controlReconnectTimer) {
+          clearTimeout(controlReconnectTimer);
+          controlReconnectTimer = null;
+        }
+        controlReconnectAttempts = 0;
+        setRemoteStatus("采集端 H.264 直连视频已连接", false);
+      } else if (peer.connectionState === "failed" || peer.connectionState === "disconnected") {
+        scheduleControlReconnect(cfg, generation, peer.connectionState === "disconnected" ? 2500 : 0);
+      }
+    };
+    peer.createOffer().then(function (offer) {
+      if (generation !== previewGeneration) { throw new Error("预览已关闭"); }
+      return peer.setLocalDescription(offer);
+    }).then(function () {
+      return waitForIceGathering(peer, 10000);
+    }).then(function () {
+      if (generation !== previewGeneration) { throw new Error("预览已关闭"); }
+      return bridge.webrtcOffer({ session_id: id, sdp: peer.localDescription.sdp });
+    }).then(function (answer) {
+      if (!answer || answer.type !== "answer" || !answer.sdp) { throw new Error("采集端返回的 SDP answer 无效"); }
+      midMap = parseVideoMids(answer.sdp);
+      return peer.setRemoteDescription({ type: answer.type, sdp: answer.sdp });
+    }).catch(function (error) {
+      if (!running || generation !== previewGeneration) { return; }
+      scheduleControlReconnect(cfg, generation);
+      setRemoteStatus("H.264/WebRTC 建连失败，正在重试：" + (error.message || error), true);
+    });
+  }
+
   function fetchFramePreview(cfg) {
     stopFramePreview();
     CAM_KEYS.forEach(function (cam) { setCamFrame(cam, null); });
     var bridge = window.dmBridge;
     if (!bridge) { return; }
+
+    var stage = $("#cap-stage");
+    var healthBox = $("#cap-preview-health");
+    if (captureMode === "remote" || captureMode === "control") {
+      if (stage) { stage.classList.toggle("is-control", captureMode === "control"); }
+      var latencyPanel = $("#cap-latency");
+      if (captureMode === "control") { startControlLatency(); }
+      else if (latencyPanel) { latencyPanel.hidden = true; }
+      if (healthBox) { healthBox.hidden = false; }
+      setRemoteStatus("正在连接采集端三路视频", false);
+      remoteProfileIndex = captureMode === "control" ? CONTROL_PROFILES.length - 1 : 0;
+      remoteHealthySince = 0;
+      remoteSlowSince = 0;
+      remoteProfileChangedAt = Date.now();
+      remoteStatusUpdatedAt = 0;
+      remoteFrameTimes = { wrist: [], global: [], third: [] };
+      remoteReceivedAt = { wrist: 0, global: 0, third: 0 };
+      remoteSourceFps = { wrist: 0, global: 0, third: 0 };
+      var generation = ++previewGeneration;
+      if (captureMode === "control") {
+        controlReconnectAttempts = 0;
+        startControlWebRTC(cfg, generation);
+        startCamWatchdog(cfg);
+        return waitForControlVideoFrames(generation, 30000);
+      }
+      CAM_KEYS.forEach(function (cam) { runRemoteStream(cam, cfg, generation); });
+      startRemoteAdaptation(cfg);
+      startCamWatchdog(cfg);
+      return;
+    }
+    if (stage) { stage.classList.remove("is-control"); }
+    var latencyPanel = $("#cap-latency");
+    if (latencyPanel) { latencyPanel.hidden = true; }
+    if (healthBox) { healthBox.hidden = true; }
+    $$("[data-cam-fps]").forEach(function (el) { el.textContent = ""; });
 
     /* 每路只允许一个请求，慢链路不积压旧帧。 */
     if (typeof bridge.frame === "function") {
@@ -657,16 +1579,37 @@ Date November 2026
 
   function stopFramePreview() {
     previewGeneration++;
+    clearRemoteRenderers();
     Object.keys(previewControllers).forEach(function (cam) {
       try { previewControllers[cam].abort(); } catch (e) {}
     });
     previewControllers = {};
+    Object.keys(remoteReconnectTimers).forEach(function (cam) {
+      clearTimeout(remoteReconnectTimers[cam]);
+      delete remoteReconnectTimers[cam];
+    });
+    if (remoteWatchTimer) { clearInterval(remoteWatchTimer); remoteWatchTimer = null; }
+    if (remoteAdaptTimer) { clearInterval(remoteAdaptTimer); remoteAdaptTimer = null; }
+    if (controlReconnectTimer) { clearTimeout(controlReconnectTimer); controlReconnectTimer = null; }
+    closeControlPeer();
     Object.keys(previewUrls).forEach(function (cam) {
       try { URL.revokeObjectURL(previewUrls[cam]); } catch (e) {}
     });
     previewUrls = {};
     if (frameTimer) { clearInterval(frameTimer); frameTimer = null; }
     if (camHealthTimer) { clearInterval(camHealthTimer); camHealthTimer = null; }
+    if (captureMode === "control" && controlMetricTimer) {
+      clearInterval(controlMetricTimer);
+      controlMetricTimer = null;
+      controlHistory = [];
+    }
+    var stage = $("#cap-stage");
+    var healthBox = $("#cap-preview-health");
+    if (stage) { stage.classList.remove("is-control"); }
+    var latencyPanel = $("#cap-latency");
+    if (latencyPanel) { latencyPanel.hidden = true; }
+    if (healthBox) { healthBox.hidden = true; }
+    $$("[data-cam-fps]").forEach(function (el) { el.textContent = ""; });
     CAM_KEYS.forEach(function (cam) { setCamFrame(cam, null); });
   }
 
@@ -696,6 +1639,7 @@ Date November 2026
   var devProbed = false;   
   var recordsBusy = false;
   var foldersBusy = false;
+  var foldersReloadPending = false;
   var lastRecordsSignature = null;
 
   function remoteMode() {
@@ -703,7 +1647,11 @@ Date November 2026
   }
 
   function loadFolders() {
-    if (!window.dmApi || foldersBusy) { return; }
+    if (!window.dmApi) { return; }
+    if (foldersBusy) {
+      foldersReloadPending = true;
+      return;
+    }
     if (!curAgent && !devProbed) {
        
       devProbed = true;
@@ -720,14 +1668,18 @@ Date November 2026
 
     foldersBusy = true;
     window.dmApi.dirs("", true).then(function (r) {
-      foldersBusy = false;
       if (capDir !== null || activeSession) { return; }
       var subs = (r.dirs || []).filter(function (s) {
         return (s.episodes || 0) > 0 || (s.records || 0) > 0;
       });
       renderFolders(subs, base);
     }).catch(function () {
+    }).then(function () {
       foldersBusy = false;
+      if (foldersReloadPending) {
+        foldersReloadPending = false;
+        loadFolders();
+      }
     });
   }
 
@@ -1326,6 +2278,7 @@ Date November 2026
   }
 
   function runSession(session, cfg) {
+    if (controlOnlyActive) { toast("仅控制模式已关闭采集功能"); return; }
     if (running) { toast("当前正在采集"); return; }
     if (!cfg) {
       cfg = loadCfg();
@@ -1344,14 +2297,17 @@ Date November 2026
     if ($("#cap-clock")) { $("#cap-clock").textContent = "00:00"; }
 
     showLive(session);
-    Promise.resolve(br().camStart(cfg, logLine)).then(function (cam) {
+    var cameraReady = Promise.resolve(br().camStart(cfg, logLine)).then(function (cam) {
       if (cam && !cam.ok) { logLine("相机预览重启失败：" + (cam.error || "未知错误"), "err"); }
       if (running) { fetchFramePreview(cfg); }
     }).catch(function (e) { logLine("相机预览重启失败：" + (e.message || e), "err"); });
     setPhase("busy", "等待标零确认");
-    return openModal({
+    return cameraReady.then(function () {
+      if (!running) { throw new Error("__abort__"); }
+      return openModal({
       title: "是否执行手臂标零？",
       ok: "执行标零", cancel: "跳过"
+      });
     }).then(function (yes) {
         if (!running) { return; }
         if (!yes) {
@@ -1378,7 +2334,7 @@ Date November 2026
           fail("机械臂未就绪", (r && r.error) || "K7Master3 未达到就绪条件");
           throw new Error("__abort__");
         }
-        logLine("K7Master3 就绪，返回值 236 已稳定 5 秒", "ok");
+        logLine("等待返回值", "ok");
 
         setPhase("busy", "启动手柄服务与采集程序");
         logLine("启动手柄服务和 " + cfg.rl_deploy_bin);
@@ -1475,20 +2431,24 @@ Date November 2026
       exiting = true;
 
       var s = activeSession;
+      var wasControlOnly = controlOnlyActive;
       var secs = timerStart ? (Date.now() - timerStart) / 1000 : 0;
 
       running = false;
+      if (wasControlOnly) { controlStartGeneration++; }
       stopTimer();
       stopFramePreview();
 
-      setPhase("busy", "正在退出采集");
+      setPhase("busy", controlOnlyActive ? "正在退出控制" : "正在退出采集");
       btnExit.disabled = true;
-      showVeil("正在发送停止指令");
+      showVeil(controlOnlyActive ? "正在发送退出指令" : "正在发送停止指令");
 
       var cfg = loadCfg();
       var collectorStopped = false;
       var stopPromise = cfg
-        ? Promise.resolve(br().captureStop(cfg, logLine))
+        ? Promise.resolve(controlOnlyActive
+            ? br().controlStop(cfg, logLine)
+            : br().captureStop(cfg, logLine))
         : Promise.resolve({ ok: false, error: "设备程序配置不可用，未发送停止指令" });
 
       stopPromise.then(function (result) {
@@ -1497,14 +2457,27 @@ Date November 2026
         }
         collectorStopped = true;
          
-        return stopSession(s, secs);
+        return wasControlOnly ? null : stopSession(s, secs);
       }).then(function (d) {
         activeSession = null;
         sessionFolder = null;
         cfgForRetry = null;
+        controlOnlyActive = false;
+        controlDeployStarted = false;
         timerStart = 0;
+        renderCaptureMode();
         if ($("#cap-clock")) { $("#cap-clock").textContent = "00:00"; }
         capDir = null;
+        var recordCard = $("#cap-records-card");
+        if (recordCard) { recordCard.hidden = true; }
+        var liveTitle = $("#t-capture-live");
+        if (liveTitle) { liveTitle.textContent = "采集"; }
+        var liveDir = $("#cap-dir");
+        if (liveDir) { liveDir.hidden = false; }
+        var liveClock = $("#cap-clock");
+        if (liveClock) { liveClock.hidden = false; }
+        var exitButton = $("#cap-exit");
+        if (exitButton) { exitButton.textContent = "退出采集"; }
         lastRecordsSignature = null;
         lastFoldersSignature = null;
         lastFolders = [];
@@ -1512,7 +2485,9 @@ Date November 2026
         hideLive();
         updateStats();
         loadFolders();
-        if (d && d.archive && d.archive.state === "compressing") {
+        if (wasControlOnly) {
+          toast("已退出远程控制");
+        } else if (d && d.archive && d.archive.state === "compressing") {
           toast("已退出采集，采集端正在压缩数据");
         } else if (d && d.archive && d.archive.state === "error") {
           var archiveError = d.archive.error || "请检查设备连接";
@@ -1528,19 +2503,24 @@ Date November 2026
           activeSession = null;
           sessionFolder = null;
           timerStart = 0;
+          renderCaptureMode();
+          var recordCard = $("#cap-records-card");
+          if (recordCard) { recordCard.hidden = true; }
+          lastFoldersSignature = null;
+          lastFolders = [];
           hideLive();
           loadFolders();
         } else {
           running = true;
           if (s) { activeSession = s; startTimerAt(s.startedAt); fetchFramePreview(loadCfg() || CFG_DEFAULT); }
-          setPhase("run", "采集中");
+          setPhase("run", controlOnlyActive ? "仅控制中" : "采集中");
         }
         hideVeil();
         exiting = false;
         btnExit.disabled = false;
         toast(collectorStopped
           ? "采集已停止，但会话记录失败；再次开始时会自动清理遗留会话"
-          : "结束采集失败，机械臂程序仍保持运行：" + (e.message || e));
+          : (controlOnlyActive ? "退出控制失败，机械臂程序仍保持运行：" : "结束采集失败，机械臂程序仍保持运行：") + (e.message || e));
       });
     });
   }
@@ -1921,6 +2901,15 @@ Date November 2026
   window.addEventListener("dm:online", function () {
     var v = document.getElementById("view-hoststatus");
     if (v && !v.hidden) { startDevPoll(); }
+  });
+
+  window.addEventListener("dm:agent-reset", function () {
+    stopDevPoll();
+    curAgent = null;
+    devList = [];
+    cfgCache = null;
+    paintDevices([], "");
+    syncCfgFromServer();
   });
 
   function connectDevice(d) {

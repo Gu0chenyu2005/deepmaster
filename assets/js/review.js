@@ -316,6 +316,8 @@ Date November 2026
 
   if (listEl) {
     listEl.addEventListener("wheel", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
       var unit = e.deltaMode === 1 ? 16 : (e.deltaMode === 2 ? listEl.clientWidth : 1);
       var delta = (Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX) * unit;
       if (!delta) { return; }
@@ -323,12 +325,7 @@ Date November 2026
       var max = listEl.scrollWidth - listEl.clientWidth;
       if (max <= 0) { return; }
 
-      var before = listEl.scrollLeft;
-      var next = Math.max(0, Math.min(max, before + delta));
-      if (next !== before) {
-        e.preventDefault();
-        listEl.scrollLeft = next;
-      }
+      listEl.scrollLeft = Math.max(0, Math.min(max, listEl.scrollLeft + delta));
     }, { passive: false });
   }
 
@@ -350,6 +347,7 @@ Date November 2026
       li.className = "rv-item" +
         (e.id === S.cur ? " is-active" : "") +
         (picked ? " is-picked" : "");
+      li.dataset.episodeId = String(e.id);
       li.setAttribute("role", "option");
       li.setAttribute("aria-selected", picked ? "true" : "false");
 
@@ -519,13 +517,17 @@ Date November 2026
     stopPreload();
     startDwell(S.dir, id);
     S.cur = id;
+    if (listEl) {
+      Array.prototype.forEach.call(listEl.querySelectorAll(".rv-item"), function (item) {
+        item.classList.toggle("is-active", item.dataset.episodeId === String(id));
+      });
+    }
     S.frame = 0;
     S.meta = null;
     S.curves = null;
     var cur = S.episodes.find(function (e) { return e.id === id; });
     S.segments = (cur && Array.isArray(cur.segments)) ? JSON.parse(JSON.stringify(cur.segments)) : [];
     clearImages();
-    renderList();
     renderFrameLabel();
 
     Promise.all([
@@ -799,7 +801,7 @@ Date November 2026
     var arr = S.curves && S.curves[cfg.data];
     if (!arr || !arr.length) {
       ctx.fillStyle = "rgba(0,0,0,.28)";
-      ctx.font = "12px system-ui, sans-serif";
+      ctx.font = "12px " + getComputedStyle(canvas).fontFamily;
       ctx.textAlign = "center";
       ctx.fillText("无数据", cssW / 2, cssH / 2);
       if (legendEl) { legendEl.innerHTML = ""; }

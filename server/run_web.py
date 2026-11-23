@@ -4,6 +4,7 @@
 # Date November 2026
 """提供静态资源并将 /api 请求转发至后端。"""
 import os, sys
+import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
@@ -40,7 +41,7 @@ class H(BaseHTTPRequestHandler):
             conn.request("GET", self.path, headers=headers)
             r = conn.getresponse()
         except Exception as e:      # noqa: BLE001
-            msg = ('{"code":502,"message":"%s"}' % e).encode()
+            msg = json.dumps({"code": 502, "message": str(e)}, ensure_ascii=False).encode()
             self.send_response(502)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(msg)))
@@ -86,21 +87,22 @@ class H(BaseHTTPRequestHandler):
                 fwd[h] = self.headers[h]
 
         upstream = None
+        timeout = 150 if self.path.startswith("/api/run/") else 30
         if _SESSION is not None:
 
             try:
-                r = _SESSION.request(method, url, data=body, headers=fwd, timeout=30)
+                r = _SESSION.request(method, url, data=body, headers=fwd, timeout=timeout)
                 code, data = r.status_code, r.content
                 ctype = r.headers.get("Content-Type")
                 upstream = r.headers
             except Exception as e:
-                code, data, ctype = 502, ('{"code":502,"message":"%s"}' % e).encode(), "application/json"
+                code, data, ctype = 502, json.dumps({"code": 502, "message": str(e)}, ensure_ascii=False).encode(), "application/json"
         else:
             req = Request(url, data=body, method=method)
             for k, v in fwd.items():
                 req.add_header(k, v)
             try:
-                r = urlopen(req, timeout=30)
+                r = urlopen(req, timeout=timeout)
                 code, data, ctype = r.status, r.read(), r.headers.get("Content-Type")
                 upstream = r.headers
             except HTTPError as e:
@@ -108,7 +110,7 @@ class H(BaseHTTPRequestHandler):
                 ctype = e.headers.get("Content-Type", "application/json")
                 upstream = e.headers
             except Exception as e:
-                code, data, ctype = 502, ('{"code":502,"message":"%s"}' % e).encode(), "application/json"
+                code, data, ctype = 502, json.dumps({"code": 502, "message": str(e)}, ensure_ascii=False).encode(), "application/json"
 
         self.send_response(code)
         self.send_header("Content-Type", ctype or "application/json")

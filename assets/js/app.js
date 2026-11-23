@@ -232,6 +232,10 @@ Date November 2026
 
     current = name;
 
+    if (name === "advanced" && window.dmSettings && window.dmSettings.refreshPairingAccess) {
+      window.dmSettings.refreshPairingAccess();
+    }
+
     if (!flipping) { syncNav(name); }
 
     var stage = document.querySelector(".stage");
@@ -531,7 +535,7 @@ Date November 2026
         });
          
         var paneTitle = to.querySelector(".authcard__title");
-        if (paneTitle) { splitTitle(paneTitle); }
+        if (paneTitle) { splitTitle(paneTitle, true); }
 
         if (!reduce) {
           var first = to.querySelector("input");
@@ -830,17 +834,18 @@ Date November 2026
   var SPLIT_SEL = ".pagehead__title, .authcard__title";
   var splitDone = {};      
 
-  function splitTitle(el) {
+  function splitTitle(el, force) {
     if (!el) { return; }
     var reduce = window.matchMedia &&
       window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     if (reduce) { return; }
 
-    if (el.dataset.splitDone === "1") { return; }
+    if (el.dataset.splitDone === "1" && !force) { return; }
     if (!el.textContent.trim()) { return; }
 
-    var text = el.textContent.trim();
+    var text = el.dataset.splitText || el.textContent.trim();
     el.textContent = "";
+    el.dataset.splitText = text;
     el.classList.add("is-split");
     Array.prototype.forEach.call(text, function (ch, i) {
       var sp = document.createElement("span");
@@ -859,7 +864,7 @@ Date November 2026
     var titles = view.querySelectorAll(SPLIT_SEL);
     Array.prototype.forEach.call(titles, function (el) {
       if (el.offsetParent === null) { return; }
-      splitTitle(el);
+      splitTitle(el, true);
     });
   }
 
@@ -902,10 +907,10 @@ Date November 2026
   }
 
   var FONT_CYCLE = [
-    { family: 'var(--dm-font-mono)',                weight: 500, tracking: '.02em' },
-    { family: 'Georgia, "Times New Roman", serif',  weight: 500, tracking: '0' },
-    { family: 'var(--dm-font-text)',                weight: 600, tracking: '-.01em' },
-    { family: 'var(--dm-font-display)',             weight: 600, tracking: '-.022em' }
+    { weight: 500, tracking: '.02em' },
+    { weight: 500, tracking: '0' },
+    { weight: 600, tracking: '-.01em' },
+    { weight: 600, tracking: '-.022em' }
   ];
   var FINAL_FONT = 3;           
   var FONT_STEP_MS = 140;       
@@ -919,7 +924,6 @@ Date November 2026
   function applyFontTo(el, i) {
     if (!el) { return; }
     var f = FONT_CYCLE[i % FONT_CYCLE.length];
-    el.style.fontFamily = f.family;
     el.style.fontWeight = String(f.weight);
     el.style.letterSpacing = f.tracking;
   }
@@ -1091,10 +1095,13 @@ Date November 2026
       if (fired) { return; }
       fired = true;
       el.classList.remove(cls);
-      el.removeEventListener("animationend", clear);
+      el.removeEventListener("animationend", onAnimationEnd);
       if (done) { done(); }
     };
-    el.addEventListener("animationend", clear);
+    var onAnimationEnd = function (event) {
+      if (event.target === el) { clear(); }
+    };
+    el.addEventListener("animationend", onAnimationEnd);
     setTimeout(clear, 900);    
   }
 
@@ -1600,7 +1607,7 @@ Date November 2026
 
   var dmDeck = (function () {
     var busy = false;
-    var under = null, sheet = null, lockUntil = 0;
+    var lockUntil = 0;
 
     function at(name) { return DECK.indexOf(name); }
     function has(name) { return at(name) >= 0; }
@@ -1611,72 +1618,43 @@ Date November 2026
     function settleStyles(view) {
       view.style.position = "";
       view.style.zIndex = "";
-      view.style.removeProperty("--dm-turn");
-      view.classList.remove("is-pageturn-in");
+      view.style.removeProperty("--dm-scroll-offset");
+      view.classList.remove("is-scroll-entering");
     }
 
-    function fwd(toName) {
-      var fromView = $("#" + ROUTES[current]);
+    function turn(toName, direction) {
       var toView = $("#" + ROUTES[toName]);
-      if (!fromView || !toView || dmReduceMotion()) { route(toName, true); return; }
+      if (!toView || dmReduceMotion()) { route(toName, true); return; }
 
       busy = true;
-      lockUntil = performance.now() + 780;
-      under = dmFreeze(fromView, true);
+      lockUntil = performance.now() + 320;
+      toView.style.setProperty("--dm-scroll-offset", (direction * 28) + "px");
+      toView.style.position = "relative";
+      toView.style.zIndex = "60";
+      toView.classList.remove("is-entering", "is-leaving", "is-pageturn-in");
+      toView.classList.add("is-scroll-entering");
       route(toName, true);
 
-      var turn = Math.round(window.innerHeight + 12) + "px";
       var landed = false;
       var settle = function () {
         if (landed) { return; }
         landed = true;
-        under = dmDropNode(under);
         settleStyles(toView);
-        sheet = dmDropNode(sheet);
         busy = false;
-        lockUntil = performance.now() + 140;    
+        lockUntil = performance.now() + 80;
         if (window.dmSyncNav) { window.dmSyncNav(); }
       };
 
-      sheet = document.createElement("div");
-      sheet.className = "is-flip-sheet";
-      sheet.style.setProperty("--dm-turn", turn);
-      document.body.appendChild(sheet);
-      dmPageTurn(sheet, "is-pageturn-in", settle);
-
-      toView.style.setProperty("--dm-turn", turn);
-      toView.style.position = "relative";       
-      toView.style.zIndex = "60";
-      dmPageTurn(toView, "is-pageturn-in", null);
-
-      if (under) {
-        var u = under;
-        requestAnimationFrame(function () { u.classList.add("is-receding"); });
-      }
-      setTimeout(settle, 1000);                 
+      requestAnimationFrame(function () {
+        requestAnimationFrame(function () {
+          toView.classList.remove("is-scroll-entering");
+        });
+      });
+      setTimeout(settle, 380);
     }
 
-    function back(toName) {
-      var fromView = $("#" + ROUTES[current]);
-      if (!fromView || dmReduceMotion()) { route(toName, true); return; }
-
-      busy = true;
-      lockUntil = performance.now() + 820;
-      under = dmFreeze(fromView, true);         
-      route(toName, true);
-      if (!under) { busy = false; return; }
-
-      var u = under;
-       
-      u.style.transition = "transform .52s cubic-bezier(.22,.9,.24,1)";
-      requestAnimationFrame(function () { u.style.transform = "translate3d(0, 108%, 0)"; });
-      setTimeout(function () {
-        under = dmDropNode(under);
-        busy = false;
-        lockUntil = performance.now() + 160;
-        if (window.dmSyncNav) { window.dmSyncNav(); }
-      }, 700);
-    }
+    function fwd(toName) { turn(toName, 1); }
+    function back(toName) { turn(toName, -1); }
 
     return {
       has: has,
@@ -1767,6 +1745,54 @@ Date November 2026
       });
     }
 
+    function refreshPairingAccess() {
+      var row = document.getElementById("set-agent-pairing-row");
+      var btn = document.getElementById("set-agent-pairing-reset");
+      var api = window.dmApi;
+      if (!row || !btn) { return; }
+      row.hidden = true;
+      if (!api || !api.me || !api.hasToken || !api.hasToken()) { return; }
+      api.me().then(function (me) {
+        row.hidden = !me || me.role !== "admin";
+      }).catch(function () { row.hidden = true; });
+    }
+
+    function resetAgentPairing() {
+      var btn = document.getElementById("set-agent-pairing-reset");
+      var modal = window.dmCapture && window.dmCapture.openModal;
+      if (!btn || !modal || !window.dmApi || !window.dmApi.resetAgentPairing) { return; }
+      modal({
+        title: "重置令牌？",
+        html: "<p>将扫描并重置所有扫描到的采集端及服务端对应的配对信息</p>",
+        ok: "重置令牌",
+        cancel: "取消",
+        danger: true,
+        anchor: btn
+      }).then(function (confirmed) {
+        if (!confirmed) { return; }
+        btn.disabled = true;
+        return window.dmApi.resetAgentPairing().then(function (result) {
+          window.dispatchEvent(new CustomEvent("dm:agent-reset"));
+          var devices = result && result.devices || [];
+          var failed = devices.filter(function (device) { return !device.reset; });
+          var details = failed.length ? "<ul>" + failed.map(function (device) {
+            return "<li>" + esc(device.host || device.ip || "采集端") + "：" +
+              esc(device.error || "重置失败") + "</li>";
+          }).join("") + "</ul>" : "";
+          return modal({
+            title: failed.length ? "部分设备重置完成" : "配对重置完成",
+            html: "<p>已重置 " + Number(result && result.reset_count || 0) +
+              " 台采集端，共扫描到 " + Number(result && result.total || 0) + " 台。</p>" + details,
+            ok: "知道了", noCancel: true, anchor: btn
+          });
+        }).catch(function (e) {
+          toast((e && e.message) || "重置配对失败");
+        }).then(function () {
+          btn.disabled = false;
+        });
+      });
+    }
+
     function init() {
       compatOn = read(K_COMPAT);
       offlineOn = read(K_OFFLINE);
@@ -1777,6 +1803,8 @@ Date November 2026
 
       wire("set-compat", setCompat);
       wire("set-offline", setOffline);
+      var resetPairingBtn = document.getElementById("set-agent-pairing-reset");
+      if (resetPairingBtn) { resetPairingBtn.addEventListener("click", resetAgentPairing); }
       loadVersion();
     }
 
@@ -1785,7 +1813,8 @@ Date November 2026
       compat: function () { return compatOn; },
       offline: function () { return offlineOn; },
       setCompat: setCompat,
-      setOffline: setOffline
+      setOffline: setOffline,
+      refreshPairingAccess: refreshPairingAccess
     };
   })();
 

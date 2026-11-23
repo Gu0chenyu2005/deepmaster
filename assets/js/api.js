@@ -191,6 +191,10 @@ Date November 2026
       return request("POST", "/agent/select", { body: { url: url || "" } });
     },
 
+    resetAgentPairing: function () {
+      return request("POST", "/agent/reset-pairing", { body: {} });
+    },
+
     getConfig: function () { return request("GET", "/config"); },
     saveConfig: function (cfg) { return request("POST", "/config", { body: cfg }); },
 

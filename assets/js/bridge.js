@@ -108,6 +108,9 @@ Date November 2026
     webrtcClose: function (sessionId) {
       return post("/webrtc/close", { session_id: sessionId });
     },
+    webrtcQuality: function (sessionId, profile) {
+      return post("/webrtc/quality", { session_id: sessionId, profile: profile });
+    },
 
     streamUrl: function (cfg, cam, profile) {
       var base = cameraBase(cfg);

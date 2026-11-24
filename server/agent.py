@@ -30,7 +30,7 @@ import cam        # noqa: E402
 import runner     # noqa: E402
 import system     # noqa: E402
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 
 STATUS_PATTERNS = {
     "k7master3": ["K7Master3"],
@@ -365,6 +365,7 @@ def start_cam_viewer(mode="shm"):
         return {"ok": False, "error": "无效相机预览模式"}
     if runner._alive(STATE["cam_key"]) and STATE.get("cam_mode") == mode:
         return {"ok": True, "already": True,
+                "webrtc_stun_port": int(port) if mode == "direct-webrtc" else None,
                 "camera_token": STATE.get("camera_token", "")}
     if runner._alive(runner.RL_KEY) and STATE.get("cam_mode") != mode:
         return {"ok": False, "error": "采集程序运行中，无法切换相机模式"}
@@ -413,6 +414,8 @@ def start_cam_viewer(mode="shm"):
         print("[agent] 相机预览启动失败：%s" % r.get("error"), flush=True)
     if r.get("ok"):
         r["camera_token"] = STATE["camera_token"]
+        if mode == "direct-webrtc":
+            r["webrtc_stun_port"] = int(port)
     return r
 
 
@@ -698,16 +701,19 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return self._err(401, "采集端请求未授权")
 
-        if head == "webrtc" and len(rest) == 2 and rest[1] in ("offer", "close"):
+        if head == "webrtc" and len(rest) == 2 and rest[1] in ("offer", "close", "quality"):
             body = self._body()
             session_id = str(body.get("session_id") or "")
             sdp = str(body.get("sdp") or "")
             if (not session_id or len(session_id) > 80 or
                     (rest[1] == "offer" and (not sdp or len(sdp) > 262144))):
                 return self._err(400, "WebRTC 信令参数无效")
+            if rest[1] == "quality" and body.get("profile") not in ("control", "control_low", "control_min"):
+                return self._err(400, "视频质量档位无效")
             try:
                 from urllib.request import Request, urlopen
-                payload = json.dumps({"session_id": session_id, "sdp": sdp}).encode("utf-8")
+                payload = json.dumps({"session_id": session_id, "sdp": sdp,
+                                      "profile": body.get("profile")}).encode("utf-8")
                 request = Request(
                     "http://127.0.0.1:%s/webrtc/%s" % (
                         STATE["cfg"].get("cam_viewer_port") or 5000, rest[1]),

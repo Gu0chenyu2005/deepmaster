@@ -292,6 +292,39 @@ class DirectPreviewTests(unittest.TestCase):
         self.assertEqual([reader.serial for reader in readers], [
             "replacement-primary", "replacement-third", "replacement-wrist"])
 
+    def test_busy_error_names_other_process_holders(self):
+        busy = "xioctl(VIDIOC_S_FMT) failed, errno=16 Last Error: Device or resource busy"
+        with patch.object(camera_shm_viewer, "_video_device_holders",
+                          return_value=({"/dev/video4": {4321}}, True)), \
+             patch.object(Path, "read_text", return_value="rl_deploy\n"):
+            detail = camera_shm_viewer._describe_busy(busy)
+        self.assertTrue(detail.startswith("相机设备忙"))
+        self.assertIn("/dev/video4", detail)
+        self.assertIn("4321(rl_deploy)", detail)
+
+    def test_busy_error_without_holders_does_not_guess_usb_state(self):
+        busy = "xioctl(VIDIOC_S_FMT) failed, errno=16 Last Error: Device or resource busy"
+        with patch.object(camera_shm_viewer, "_video_device_holders",
+                          return_value=({}, True)):
+            detail = camera_shm_viewer._describe_busy(busy)
+        self.assertEqual(detail, "相机设备忙；未查到其他进程占用")
+
+    def test_busy_error_reports_incomplete_process_scan(self):
+        busy = "xioctl(VIDIOC_S_FMT) failed, errno=16 Last Error: Device or resource busy"
+        with patch.object(camera_shm_viewer, "_video_device_holders",
+                          return_value=({}, False)):
+            detail = camera_shm_viewer._describe_busy(busy)
+        self.assertEqual(detail, "相机设备忙；占用进程检查不完整")
+
+    def test_camera_read_errors_are_shortened(self):
+        detail = camera_shm_viewer._describe_busy(
+            "Frame didn't arrive within 5000; " + "detail " * 100)
+        self.assertEqual(detail, "相机取帧超时")
+
+    def test_non_busy_error_is_unchanged(self):
+        detail = camera_shm_viewer._describe_busy("camera disconnected")
+        self.assertEqual(detail, "相机已断开")
+
 
 if __name__ == "__main__":
     unittest.main()

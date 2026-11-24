@@ -50,7 +50,7 @@ TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(TOOL_DIR)
 
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 DEFAULT_DATA = os.environ.get("DM_DATA_DIR", os.path.join(PROJECT_DIR, "datasets"))
 _pos = [a for a in sys.argv[1:] if not a.startswith("-")]
 INIT_DATA = os.path.abspath(_pos[0]) if _pos else DEFAULT_DATA
@@ -3273,7 +3273,7 @@ class Handler(BaseHTTPRequestHandler):
                                             body.get("status"),
                                             body.get("comment"), user))
 
-        if head == "webrtc" and len(rest) >= 2 and rest[1] in ("offer", "close"):
+        if head == "webrtc" and len(rest) >= 2 and rest[1] in ("offer", "close", "quality"):
             user = self._user(required=True, min_role="user")
             body = self._body()
             if not isinstance(body, dict):
@@ -3283,11 +3283,14 @@ class Handler(BaseHTTPRequestHandler):
             if (not session_id or len(session_id) > 80 or
                     (rest[1] == "offer" and (not sdp or len(sdp) > 262144))):
                 raise err400("WebRTC 信令参数无效")
+            if rest[1] == "quality" and body.get("profile") not in ("control", "control_low", "control_min"):
+                raise err400("视频质量档位无效")
             if not agent_on():
                 raise err400("WebRTC 直连预览需要在线采集端")
             try:
                 result = _agent_call("/api/webrtc/" + rest[1],
-                                     {"session_id": session_id, "sdp": sdp},
+                                     {"session_id": session_id, "sdp": sdp,
+                                      "profile": body.get("profile")},
                                      timeout=20)
             except AgentDown as exc:
                 return self._send(503, {"code": 503, "message": str(exc),

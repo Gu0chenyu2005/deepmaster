@@ -146,6 +146,7 @@ async function main() {
 
   const timeoutScope = Object.assign({}, readinessScope, {
     controlVideoEls: {}, previewGeneration: 10,
+    controlPeer: { connectionState: 'connecting', iceConnectionState: 'checking' },
     setInterval: readinessScope.setInterval,
     clearInterval: readinessScope.clearInterval
   });
@@ -155,7 +156,7 @@ async function main() {
   const timeoutTimer = readinessTimers[1];
   readinessNow += 101;
   timeoutTimer.fn();
-  await assert.rejects(videoTimeout, /等待三路 H\.264 视频画面超时/);
+  await assert.rejects(videoTimeout, /H\.264 视频超时（连接 connecting，ICE checking/);
 
   let releaseClose;
   let peerClosed = false;
@@ -192,6 +193,35 @@ async function main() {
   assert.deepEqual(JSON.parse(JSON.stringify(midScope.parseVideoMids(
     'v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:2\r\n'))),
     { '0': 'wrist', '1': 'global', '2': 'third' });
+
+  const trackMapScope = {};
+  vm.createContext(trackMapScope);
+  const trackMapStart = source.indexOf('  function controlCameraForTrack(');
+  const trackMapEnd = source.indexOf('  function clearControlVideos(', trackMapStart);
+  vm.runInContext(source.slice(trackMapStart, trackMapEnd), trackMapScope);
+  const wristTransceiver = { mid: '2' };
+  const cameraByTransceiver = new Map([[wristTransceiver, 'wrist']]);
+  assert.equal(trackMapScope.controlCameraForTrack(wristTransceiver, cameraByTransceiver,
+    { '2': 'third' }, 'global'), 'wrist', 'transceiver identity takes precedence over mids');
+  assert.equal(trackMapScope.controlCameraForTrack({ mid: '1' }, cameraByTransceiver,
+    { '1': 'global' }, 'third'), 'global', 'SDP mid is used as a fallback');
+  assert.equal(trackMapScope.controlCameraForTrack({ mid: null }, cameraByTransceiver,
+    {}, 'third'), 'third', 'track order is the final fallback');
+
+  const trackScope = { MediaStream: class {
+    constructor(tracks) { this.tracks = tracks; }
+  } };
+  vm.createContext(trackScope);
+  const trackStart = source.indexOf('  function controlTrackStream(');
+  const trackEnd = source.indexOf('  function clearControlVideos(', trackStart);
+  vm.runInContext(source.slice(trackStart, trackEnd), trackScope);
+  const wristTrack = { id: 'wrist' };
+  const globalTrack = { id: 'global' };
+  const wristStream = trackScope.controlTrackStream(wristTrack);
+  const globalStream = trackScope.controlTrackStream(globalTrack);
+  assert.deepEqual(wristStream.tracks, [wristTrack]);
+  assert.deepEqual(globalStream.tracks, [globalTrack]);
+  assert.notEqual(wristStream, globalStream, 'each camera must get an isolated media stream');
   vm.runInContext(source.slice(source.indexOf('  function fetchFramePreview(cfg)'), source.indexOf('  var recListEl')), scope);
   scope.fetchFramePreview(cfg);
   const flush = async () => { for (let i = 0; i < 15; i++) await Promise.resolve(); };

@@ -408,10 +408,15 @@ Date November 2026
   $$("[data-capture-mode]").forEach(function (button) {
     button.addEventListener("click", function () {
       if (running) { return; }
+      var previousMode = captureMode;
       captureMode = button.dataset.captureMode === "control" ? "control" :
         button.dataset.captureMode === "remote" ? "remote" : "near";
       try { sessionStorage.setItem(CAP_MODE_KEY, captureMode); } catch (e) {}
       renderCaptureMode();
+      if (previousMode === "control" && captureMode !== "control") {
+        lastFoldersSignature = null;
+        loadFolders();
+      }
     });
   });
   renderCaptureMode();
@@ -521,6 +526,7 @@ Date November 2026
       setPhase("busy", "启动直连相机");
       Promise.resolve(br().camStart(cfg, logLine, "direct-webrtc")).then(function (camera) {
         if (!camera || !camera.ok) { throw new Error((camera && camera.error) || "直连相机服务启动失败"); }
+        cfg._webrtcStunPort = camera.webrtc_stun_port;
         controlCameraStarted = !camera.already;
         return waitForDirectCameras(cfg, 15);
       }).then(function () {
@@ -754,6 +760,11 @@ Date November 2026
   var controlVideoEls = {};
   var controlReconnectTimer = null;
   var controlReconnectAttempts = 0;
+  var controlQualityTimer = null;
+  var controlQualityIndex = 0;
+  var controlQualityBad = 0;
+  var controlQualityGood = 0;
+  var controlQualityStats = null;
 
   var camHadFrame = { wrist: false, global: false, third: false };
 
@@ -1313,6 +1324,15 @@ Date November 2026
     return result;
   }
 
+  function controlTrackStream(track) {
+    return new MediaStream([track]);
+  }
+
+  function controlCameraForTrack(transceiver, transceiverCams, midMap, fallbackCam) {
+    return transceiverCams.get(transceiver) ||
+      midMap[transceiver && transceiver.mid] || fallbackCam || "";
+  }
+
   function clearControlVideos() {
     Object.keys(controlVideoEls).forEach(function (cam) {
       var video = controlVideoEls[cam];
@@ -1340,6 +1360,10 @@ Date November 2026
     controlPeerSession = "";
     if (peer) { try { peer.close(); } catch (e) {} }
     clearControlVideos();
+    if (typeof controlQualityTimer !== "undefined" && controlQualityTimer) {
+      clearInterval(controlQualityTimer); controlQualityTimer = null;
+    }
+    if (typeof controlQualityStats !== "undefined") { controlQualityStats = null; }
     var bridge = window.dmBridge;
     if (sessionId && bridge && bridge.webrtcClose) {
       return Promise.resolve().then(function () {
@@ -1347,6 +1371,62 @@ Date November 2026
       }).catch(function () {});
     }
     return Promise.resolve();
+  }
+
+  function adaptControlVideoQuality() {
+    if (!controlPeer || typeof controlPeer.getStats !== "function" || !running ||
+        captureMode !== "control" || !controlPeerSession || !window.dmBridge ||
+        typeof window.dmBridge.webrtcQuality !== "function") { return; }
+    Promise.resolve(controlPeer.getStats()).then(function (report) {
+      var received = 0, lost = 0, frames = 0, bytes = 0, rtt = 0, rttCount = 0;
+      report.forEach(function (item) {
+        if (item.type === "inbound-rtp" && (item.kind === "video" || item.mediaType === "video")) {
+          received += Number(item.packetsReceived || 0);
+          lost += Number(item.packetsLost || 0);
+          frames += Number(item.framesDecoded || 0);
+          bytes += Number(item.bytesReceived || 0);
+        } else if (item.type === "candidate-pair" && item.selected && Number(item.currentRoundTripTime) > 0) {
+          rtt += Number(item.currentRoundTripTime) * 1000;
+          rttCount++;
+        }
+      });
+      var previous = controlQualityStats;
+      controlQualityStats = { received: received, lost: lost, frames: frames, bytes: bytes, at: Date.now() };
+      if (!previous || controlQualityStats.at - previous.at < 1000) { return; }
+      var elapsed = (controlQualityStats.at - previous.at) / 1000;
+      var fps = Math.max(0, (frames - previous.frames) / elapsed);
+      var packetDelta = Math.max(0, (received - previous.received) + (lost - previous.lost));
+      var loss = packetDelta ? Math.max(0, lost - previous.lost) / packetDelta : 0;
+      var bad = loss > 0.04 || fps < 18 || (rttCount && rtt / rttCount > 240) ||
+        (bytes <= previous.bytes && fps < 24);
+      if (bad) {
+        controlQualityGood = 0;
+        controlQualityBad++;
+      } else {
+        controlQualityBad = 0;
+        controlQualityGood++;
+      }
+      var profiles = ["control", "control_low", "control_min"];
+      if (controlQualityBad >= 2 && controlQualityIndex < profiles.length - 1) {
+        controlQualityIndex++;
+        controlQualityBad = 0;
+        setRemoteStatus("网络拥塞，降低画质以保持帧率", true);
+        window.dmBridge.webrtcQuality(controlPeerSession, profiles[controlQualityIndex]).catch(function () {});
+      } else if (controlQualityGood >= 8 && controlQualityIndex > 0) {
+        controlQualityIndex--;
+        controlQualityGood = 0;
+        window.dmBridge.webrtcQuality(controlPeerSession, profiles[controlQualityIndex]).catch(function () {});
+      }
+    }).catch(function () {});
+  }
+
+  function startControlVideoQuality() {
+    if (controlQualityTimer) { clearInterval(controlQualityTimer); }
+    controlQualityIndex = 0;
+    controlQualityBad = 0;
+    controlQualityGood = 0;
+    controlQualityStats = null;
+    controlQualityTimer = setInterval(adaptControlVideoQuality, 2000);
   }
 
   function waitForIceGathering(peer, timeoutMs) {
@@ -1369,6 +1449,7 @@ Date November 2026
   function waitForControlVideoFrames(generation, timeoutMs) {
     return new Promise(function (resolve, reject) {
       var deadline = Date.now() + timeoutMs;
+      var lastStats = 0;
       var timer = setInterval(function () {
         if (!running || generation !== previewGeneration) {
           clearInterval(timer);
@@ -1384,7 +1465,57 @@ Date November 2026
           resolve(true);
         } else if (Date.now() >= deadline) {
           clearInterval(timer);
-          reject(new Error("等待三路 H.264 视频画面超时，未启动遥操程序"));
+          var peer = controlPeer;
+          var frames = CAM_KEYS.map(function (cam) {
+            var video = controlVideoEls[cam];
+            return cam + ":" + (video && video.videoWidth ? "已解码" : "无画面");
+          }).join("，");
+          var connection = peer ? peer.connectionState : "未建立";
+          var ice = peer ? peer.iceConnectionState : "未建立";
+          if (peer && typeof peer.getStats === "function" && !lastStats) {
+            lastStats = 1;
+            peer.getStats().then(function (report) {
+              var transport = null;
+              var tracks = [];
+              var selectedPairId = null;
+              var candidates = {};
+              report.forEach(function (item) {
+                if (item.type === "local-candidate" || item.type === "remote-candidate") {
+                  candidates[item.id] = (item.address || item.ip || "?") + ":" +
+                    (item.port || "?") + "/" + (item.protocol || "?");
+                }
+                if (item.type === "candidate-pair" && item.selected) {
+                  selectedPairId = item.id;
+                }
+              });
+              report.forEach(function (item) {
+                if (item.type === "transport") {
+                  selectedPairId = item.selectedCandidatePairId || selectedPairId;
+                  transport = "DTLS " + (item.dtlsState || "?") + ", 收发 " +
+                    (item.bytesReceived || 0) + "/" + (item.bytesSent || 0) + "B";
+                } else if (item.type === "inbound-rtp" && item.kind === "video") {
+                  tracks.push((item.mid || "?") + ":包 " + (item.packetsReceived || 0) +
+                    ",帧 " + (item.framesDecoded || 0));
+                }
+              });
+              var selectedPair = report.get && selectedPairId
+                ? report.get(selectedPairId) : null;
+              var path = selectedPair
+                ? "路径 " + (candidates[selectedPair.localCandidateId] || "?") + "→" +
+                  (candidates[selectedPair.remoteCandidateId] || "?") : "无选中 ICE 路径";
+              reject(new Error("H.264 视频超时（连接 " + connection + "，ICE " + ice +
+                "；" + (transport || "DTLS 未就绪") + "；" + path + "；" +
+                (tracks.join("，") || frames) + "），未启动遥操"));
+            }).catch(function () {
+              reject(new Error("H.264 视频超时（连接 " + connection + "，ICE " + ice +
+                "；" + frames + "），未启动遥操"));
+            });
+          } else if (!peer) {
+            reject(new Error("等待三路 H.264 视频画面超时，未启动遥操"));
+          } else if (typeof peer.getStats !== "function") {
+            reject(new Error("H.264 视频超时（连接 " + connection + "，ICE " + ice +
+              "；" + frames + "），未启动遥操"));
+          }
         }
       }, 100);
     });
@@ -1418,16 +1549,31 @@ Date November 2026
     }
     var id = window.crypto && window.crypto.randomUUID
       ? window.crypto.randomUUID() : "dm-" + Date.now() + "-" + Math.random().toString(16).slice(2);
-    var peer = new RTCPeerConnection({ iceServers: [] });
+    var stunHost = new URL(cfg._agent.url).hostname;
+    var stunPort = Number(cfg._webrtcStunPort);
+    if (!Number.isInteger(stunPort) || stunPort < 1 || stunPort > 65535) {
+      setRemoteStatus("采集端地址发现未就绪，请更新采集端后重试", true);
+      return;
+    }
+    var peer = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:" + stunHost + ":" + stunPort }]
+    });
     controlPeer = peer;
     controlPeerSession = id;
     var midMap = {};
-    CAM_KEYS.forEach(function () {
+    var transceiverCams = new Map();
+    var fallbackTrackIndex = 0;
+    CAM_KEYS.forEach(function (cam) {
       var transceiver = peer.addTransceiver("video", { direction: "recvonly" });
+      transceiverCams.set(transceiver, cam);
       if ("jitterBufferTarget" in transceiver.receiver) { transceiver.receiver.jitterBufferTarget = 0; }
     });
     peer.ontrack = function (event) {
-      var cam = midMap[event.transceiver && event.transceiver.mid];
+      var transceiver = event.transceiver;
+      var byTransceiver = transceiverCams.get(transceiver);
+      var byMid = midMap[transceiver && transceiver.mid];
+      var cam = controlCameraForTrack(transceiver, transceiverCams, midMap,
+        byTransceiver || byMid ? "" : CAM_KEYS[fallbackTrackIndex++]);
       if (!cam || !running || generation !== previewGeneration) { return; }
       var img = $("#cap-img-" + cam);
       var panel = img && img.closest(".cap-cam");
@@ -1451,8 +1597,7 @@ Date November 2026
       img.hidden = true;
       var placeholder = panel.querySelector(".cap-cam__ph");
       if (placeholder) { placeholder.hidden = true; }
-      video.srcObject = event.streams && event.streams[0]
-        ? event.streams[0] : new MediaStream([event.track]);
+      video.srcObject = controlTrackStream(event.track);
       if (!controlMetrics[cam]) { watchControlFrames(cam, video, generation); }
       video.play().catch(function () {});
       remoteReceivedAt[cam] = Date.now();
@@ -1471,6 +1616,7 @@ Date November 2026
         scheduleControlReconnect(cfg, generation, peer.connectionState === "disconnected" ? 2500 : 0);
       }
     };
+    startControlVideoQuality();
     peer.createOffer().then(function (offer) {
       if (generation !== previewGeneration) { throw new Error("预览已关闭"); }
       return peer.setLocalDescription(offer);
@@ -1642,12 +1788,23 @@ Date November 2026
   var foldersReloadPending = false;
   var lastRecordsSignature = null;
 
+  function hideRecordBrowser() {
+    var card = $("#cap-records-card");
+    var empty = $("#cap-empty");
+    if (card) { card.hidden = true; }
+    if (empty) { empty.hidden = true; }
+  }
+
   function remoteMode() {
     return !!(hasCurrent() && curAgent && curAgent.data_root);
   }
 
   function loadFolders() {
     if (!window.dmApi) { return; }
+    if (captureMode === "control") {
+      hideRecordBrowser();
+      return;
+    }
     if (foldersBusy) {
       foldersReloadPending = true;
       return;
@@ -1708,6 +1865,10 @@ Date November 2026
   }
 
   function renderFolders(folders, base) {
+    if (captureMode === "control") {
+      hideRecordBrowser();
+      return;
+    }
     var listF = $("#cap-folder-list");
     if (!listF) { return; }
     var signature = JSON.stringify((folders || []).map(function (f) {

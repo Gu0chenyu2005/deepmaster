@@ -15,6 +15,7 @@ async function main() {
   let calls = 0;
   const card = { hidden: false };
   const scope = {
+    captureMode: 'near',
     window: { dmApi: { dirs: () => {
       calls++;
       if (calls === 1) {
@@ -44,6 +45,39 @@ async function main() {
 
   assert.equal(calls, 2, 'a refresh requested during an in-flight request must run afterward');
   assert.equal(card.hidden, true, 'the refreshed empty listing must hide the folder panel');
+
+  const controlCard = { hidden: false };
+  const controlEmpty = { hidden: false };
+  let controlCalls = 0;
+  const controlScope = {
+    window: { dmApi: { dirs: () => { controlCalls++; return Promise.resolve({ dirs: [] }); } } },
+    captureMode: 'control',
+    curAgent: { data_root: '/data' },
+    devProbed: true,
+    activeSession: null,
+    foldersBusy: false,
+    hasCurrent: () => true,
+    $: selector => selector === '#cap-records-card' ? controlCard
+      : selector === '#cap-empty' ? controlEmpty : null,
+    setFolderMode: () => {},
+    recordingBase: () => '/data',
+    renderFolders: () => { controlCard.hidden = false; },
+    lastFolders: [],
+    paintUpStates: () => {},
+    syncUploadBtn: () => {}
+  };
+  vm.createContext(controlScope);
+  vm.runInContext(source.slice(start, end), controlScope);
+  controlScope.loadFolders();
+  assert.equal(controlCalls, 0, 'control-only mode must not request recording folders');
+  assert.equal(controlCard.hidden, true);
+  assert.equal(controlEmpty.hidden, true);
+
+  const renderStart = source.indexOf('  function renderFolders(');
+  const renderEnd = source.indexOf('  function confirmDeleteFolder(', renderStart);
+  vm.runInContext(source.slice(renderStart, renderEnd), controlScope);
+  controlScope.renderFolders([{ name: 'stale', path: '/data/stale', episodes: 1 }], '/data');
+  assert.equal(controlCard.hidden, true, 'late folder responses must stay hidden in control-only mode');
   console.log('Folder panel follows the latest listing after stop');
 }
 

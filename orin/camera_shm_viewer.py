@@ -358,6 +358,73 @@ def select_direct_profiles(device, rs):
         -p.fps(), formats.index(p.format()), -p.width() * p.height()))
 
 
+def _video_device_holders(exclude_pid=None):
+    """列出打开 /dev/video* 的进程，用于诊断 EBUSY(errno=16) 占用者。"""
+    holders = {}
+    scan_complete = True
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return holders, False
+    for entry in entries:
+        if not entry.isdigit() or (exclude_pid is not None and int(entry) == exclude_pid):
+            continue
+        fd_dir = os.path.join("/proc", entry, "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except PermissionError:
+            scan_complete = False
+            continue
+        except FileNotFoundError:
+            continue
+        except OSError:
+            scan_complete = False
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                scan_complete = False
+                continue
+            except OSError:
+                continue
+            if target.startswith("/dev/video"):
+                holders.setdefault(target, set()).add(int(entry))
+    return holders, scan_complete
+
+
+def _describe_busy(exc):
+    """EBUSY 时附加占用者线索，否则原样返回错误文本。"""
+    text = str(exc)
+    if "errno=16" not in text and "resource busy" not in text.lower():
+        lowered = text.lower()
+        if "frame didn't arrive" in lowered:
+            return "相机取帧超时"
+        if "camera disconnected" in lowered:
+            return "相机已断开"
+        return text[:160]
+    holders, scan_complete = _video_device_holders(exclude_pid=os.getpid())
+    if not holders:
+        if not scan_complete:
+            return "相机设备忙；占用进程检查不完整"
+        return "相机设备忙；未查到其他进程占用"
+    names = []
+    for pid in sorted({pid for pids in holders.values() for pid in pids})[:8]:
+        try:
+            comm = Path(os.path.join("/proc", str(pid), "comm")).read_text(
+                encoding="utf-8").strip()
+        except OSError:
+            comm = "?"
+        names.append("%d(%s)" % (pid, comm))
+    nodes = ", ".join(sorted(holders))
+    suffix = "；占用线索 %s：%s" % (nodes, ", ".join(names))
+    if not scan_complete:
+        suffix += "（检查不完整）"
+    return "相机设备忙" + suffix
+
+
 class DirectCameraReader:
     """相机独占读取最新帧；网络与编码不阻塞相机读取线程。"""
 
@@ -494,9 +561,12 @@ class DirectCameraReader:
                                     data, frame.get_width(), frame.get_height(),
                                     self.pixel_format, captured_at)
             except Exception as exc:
+                detail = _describe_busy(exc)
+                if detail != str(exc):
+                    print(f"[direct] {self.name}: {detail}", flush=True)
                 with self.condition:
                     self.present = False
-                    self.error = f"direct camera read failed: {exc}"
+                    self.error = f"direct camera read failed: {detail}"
                     self.condition.notify_all()
             finally:
                 if pipeline is not None:
@@ -745,7 +815,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path not in ("/webrtc/offer", "/webrtc/close") or WEBRTC is None:
+        if parsed.path not in ("/webrtc/offer", "/webrtc/close", "/webrtc/quality") or WEBRTC is None:
             return self._send(404, "application/json", b'{"error":"not found"}')
         supplied = self.headers.get("X-DM-WebRTC-Token", "")
         if not WEBRTC_TOKEN or not hmac.compare_digest(supplied, WEBRTC_TOKEN):
@@ -755,8 +825,12 @@ class Handler(BaseHTTPRequestHandler):
             if size <= 0 or size > 262144:
                 raise ValueError("信令内容长度无效")
             body = json.loads(self.rfile.read(size))
-            result = WEBRTC.offer(body) if parsed.path.endswith("offer") else WEBRTC.close(
-                str(body.get("session_id") or ""))
+            if parsed.path.endswith("offer"):
+                result = WEBRTC.offer(body)
+            elif parsed.path.endswith("quality"):
+                result = WEBRTC.set_quality(body.get("session_id"), body.get("profile"))
+            else:
+                result = WEBRTC.close(str(body.get("session_id") or ""))
             encoded = json.dumps(result, ensure_ascii=False).encode()
             return self._send(200, "application/json; charset=utf-8", encoded)
         except (ValueError, RuntimeError, TimeoutError) as exc:
@@ -922,9 +996,11 @@ def main():
             sys.exit("[FATAL] 没有配置任何共享内存段")
 
     start_segments(SEGMENTS)
+    stun_server = None
     if args.webrtc:
         try:
-            from webrtc_preview import session_manager
+            from webrtc_preview import session_manager, LocalStunServer
+            stun_server = LocalStunServer(args.host, args.port)
             WEBRTC = session_manager(SEGMENTS)
         except Exception as exc:
             sys.exit("[FATAL] WebRTC 初始化失败：%s" % exc)
@@ -936,6 +1012,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if stun_server:
+            stun_server.close()
         for s in SEGMENTS:
             s.stop()
 

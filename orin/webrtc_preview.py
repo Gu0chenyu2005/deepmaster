@@ -7,6 +7,97 @@
 import threading
 import time
 import os
+import socket
+import struct
+import ipaddress
+
+
+QUALITY_PROFILES = {
+    "control": (2600000, 1.0),
+    "control_low": (1500000, 0.75),
+    "control_min": (800000, 0.5),
+}
+
+
+def prefer_numeric_candidates(text):
+    sections = []
+    for line in text.splitlines():
+        if not sections or line.startswith("m="):
+            sections.append([])
+        sections[-1].append(line)
+    result = []
+    for section in sections:
+        numeric = False
+        for line in section:
+            fields = line.split()
+            if line.startswith("a=candidate:") and len(fields) >= 8:
+                try:
+                    ipaddress.ip_address(fields[4])
+                    numeric = True
+                except ValueError:
+                    pass
+        for line in section:
+            fields = line.split()
+            if (numeric and line.startswith("a=candidate:") and len(fields) >= 8
+                    and fields[4].lower().endswith(".local")):
+                continue
+            result.append(line)
+    return "\r\n".join(result) + "\r\n"
+
+
+class LocalStunServer:
+    """为直连浏览器提供地址发现，避免依赖 mDNS。"""
+
+    COOKIE = 0x2112A442
+
+    def __init__(self, host, port):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.socket.bind((host, port))
+            self.socket.settimeout(0.5)
+        except Exception:
+            self.socket.close()
+            raise
+        self.port = self.socket.getsockname()[1]
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._serve, name="webrtc-stun", daemon=True)
+        self.thread.start()
+
+    @classmethod
+    def binding_response(cls, data, address):
+        if len(data) < 20 or len(data) > 2048:
+            return None
+        kind, size, cookie = struct.unpack("!HHI", data[:8])
+        if kind != 1 or cookie != cls.COOKIE or size % 4 or len(data) != 20 + size:
+            return None
+        ip = struct.unpack("!I", socket.inet_aton(address[0]))[0]
+        mapped = struct.pack("!HHBBHI", 0x20, 8, 0, 1,
+                             address[1] ^ (cookie >> 16), ip ^ cookie)
+        return struct.pack("!HH", 0x101, len(mapped)) + data[4:20] + mapped
+
+    def _serve(self):
+        window, count = time.monotonic(), 0
+        while not self.stopped.is_set():
+            try:
+                data, address = self.socket.recvfrom(2049)
+                now = time.monotonic()
+                if now - window >= 1:
+                    window, count = now, 0
+                count += 1
+                if count > 128:
+                    continue
+                response = self.binding_response(data, address)
+                if response:
+                    self.socket.sendto(response, address)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+    def close(self):
+        self.stopped.set()
+        self.socket.close()
+        self.thread.join(timeout=1)
 
 
 class WebRTCPreview:
@@ -24,6 +115,7 @@ class WebRTCPreview:
         self.loop_thread = None
         self.monitor_thread = None
         self.monitor_started = False
+        self._last_connection_log = None
 
     def _load(self):
         if self.gst:
@@ -61,14 +153,72 @@ class WebRTCPreview:
                     continue
                 connection = state["pc"].get_property("connection-state")
                 name = getattr(connection, "value_nick", str(connection)).lower()
+                ice = state["pc"].get_property("ice-connection-state")
+                ice_name = getattr(ice, "value_nick", str(ice)).lower()
+                pair = (name, ice_name)
+                if pair != self._last_connection_log:
+                    print("[webrtc] connection=%s ice=%s" % pair, flush=True)
+                    self._last_connection_log = pair
+                now = time.monotonic()
+                if now - state.get("last_stats_log", 0) >= 5:
+                    state["last_stats_log"] = now
+                    counts = state.get("frame_counts", {})
+                    packets = state.get("rtp_counts", {})
+                    print("[webrtc] video frames=%s rtp_packets=%s" %
+                          (counts, packets), flush=True)
+                bus = state["pipeline"].get_bus()
+                message = bus.pop_filtered(self.gst.MessageType.ERROR)
+                while message:
+                    error, debug = message.parse_error()
+                    print("[webrtc] pipeline error: %s (%s)" % (error, debug), flush=True)
+                    message = bus.pop_filtered(self.gst.MessageType.ERROR)
                 if name == "connected":
                     state["touched"] = time.monotonic()
+                    if not state.get("keyframe_requested"):
+                        self._request_keyframes(state)
+                        state["keyframe_requested"] = True
                 elif name in ("failed", "disconnected", "closed"):
                     state.setdefault("disconnected_at", time.monotonic())
                     if time.monotonic() - state["disconnected_at"] >= 6:
                         self._close_locked(state["id"])
                 else:
                     state.pop("disconnected_at", None)
+
+    @staticmethod
+    def _request_keyframes(state):
+        for encoder in state.get("encoders", {}).values():
+            try:
+                encoder.emit("force-IDR")
+            except Exception:
+                pass
+
+    def set_quality(self, session_id, profile):
+        """调整当前会话码率，保持连接和源帧率不变。"""
+        profile = str(profile or "")
+        settings = QUALITY_PROFILES.get(profile)
+        if not settings:
+            raise ValueError("不支持的视频质量档位")
+        bitrate, scale = settings
+        with self.lock:
+            state = self.session
+            if not state or state.get("id") != str(session_id or ""):
+                return {"ok": False, "changed": False}
+            previous = state.get("quality", "control")
+            for encoder in state.get("encoders", {}).values():
+                encoder.set_property("bitrate", bitrate)
+            for scaler, source_size in state.get("scalers", {}).values():
+                width = max(320, int(source_size[0] * scale) // 2 * 2)
+                height = max(240, int(source_size[1] * scale) // 2 * 2)
+                caps = self.gst.Caps.from_string(
+                    "video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d" %
+                    (width, height))
+                scaler.set_property("caps", caps)
+            state["quality"] = profile
+            state["touched"] = time.monotonic()
+            if previous != profile:
+                print("[webrtc] quality=%s bitrate=%d" % (profile, bitrate), flush=True)
+            return {"ok": True, "changed": previous != profile,
+                    "profile": profile, "bitrate": bitrate, "scale": scale}
 
     @staticmethod
     def _promise_value(gst, element, signal, *args):
@@ -82,6 +232,7 @@ class WebRTCPreview:
         return reply
 
     def _parse_offer(self, text):
+        text = prefer_numeric_candidates(text)
         _, message = self.sdp.SDPMessage.new()
         if self.sdp.sdp_message_parse_buffer(text.encode(), message) != self.sdp.SDPResult.OK:
             raise ValueError("浏览器 SDP offer 格式错误")
@@ -125,7 +276,10 @@ class WebRTCPreview:
             remote, codecs = self._parse_offer(offer)
             self.session = {"id": session_id, "touched": time.monotonic(),
                             "pipeline": self.gst.Pipeline.new("dm-webrtc-preview"),
-                            "sources": {}, "rtp_pads": {}, "pc": None}
+                            "sources": {}, "encoders": {}, "scalers": {},
+                            "rtp_pads": {}, "pc": None,
+                            "frame_counts": {}, "rtp_counts": {}, "last_stats_log": 0,
+                            "quality": "control"}
             try:
                 self._build_pipeline(codecs)
                 return self._answer(remote)
@@ -225,12 +379,22 @@ class WebRTCPreview:
                     raise RuntimeError("无法连接 %s 视频编码管线" % name)
             # Drop complete raw frames only; one encoded frame can span several RTP packets.
             src_pad = rtp_caps.get_static_pad("src")
+            state["rtp_counts"][name] = 0
+
+            def count_rtp(_pad, _info, _state=state, _name=name):
+                _state["rtp_counts"][_name] = _state["rtp_counts"].get(_name, 0) + 1
+                return gst.PadProbeReturn.OK
+
+            src_pad.add_probe(gst.PadProbeType.BUFFER, count_rtp)
             sink = pc.request_pad_simple("sink_%u")
             if sink is None or src_pad.link(sink) != gst.PadLinkReturn.OK:
                 raise RuntimeError("无法添加 %s 视频轨道" % name)
             transceiver = sink.get_property("transceiver")
             transceiver.set_property("direction", self.webrtc.WebRTCRTPTransceiverDirection.SENDONLY)
             state["sources"][name] = (src, fmt, width, height)
+            state["frame_counts"][name] = 0
+            state["encoders"][name] = encoder
+            state["scalers"][name] = (capsfilter, (width, height))
             state["rtp_pads"][name] = src_pad
         pipeline.set_state(gst.State.PLAYING)
 
@@ -258,6 +422,10 @@ class WebRTCPreview:
             time.sleep(0.05)
         self.session["touched"] = time.monotonic()
         local = pc.get_property("local-description")
+        candidates = [line.strip() for line in local.sdp.as_text().splitlines()
+                      if line.startswith("a=candidate:")]
+        print("[webrtc] gathered %d ICE candidates: %s" %
+              (len(candidates), ", ".join(candidates[:6])), flush=True)
         return {"session_id": self.session["id"], "sdp": local.sdp.as_text(),
                 "type": "answer"}
 
@@ -287,7 +455,11 @@ class WebRTCPreview:
         fps = max(1, min(int(self.readers[name].source_fps or 30), 60))
         buffer.duration = self.gst.SECOND // fps
         try:
-            src.emit("push-buffer", buffer)
+            result = src.emit("push-buffer", buffer)
+            if result == self.gst.FlowReturn.OK:
+                state["frame_counts"][name] = state["frame_counts"].get(name, 0) + 1
+            elif result not in (None, self.gst.FlowReturn.FLUSHING):
+                print("[webrtc] %s appsrc=%s" % (name, result), flush=True)
         except Exception:
             pass
 

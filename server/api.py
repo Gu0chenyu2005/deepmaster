@@ -4,6 +4,7 @@
 """业务接口：鉴权、采集端通信、数据审核与导出。"""
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -237,8 +238,8 @@ def _pick_port(reg, device_id, skip=()):
     raise err400("通信端口已用尽（%d-65535 全被占用）" % PORT_POOL_START)
 
 
-def _local_subnets(limit=6):
-    """枚举非虚拟网卡的 IPv4 /24 网段。"""
+def _local_subnets(limit=16):
+    """枚举非虚拟网卡覆盖的 /24 网段。"""
     skip = ("docker", "veth", "br-", "virbr", "vmnet", "tun", "tap", "utun",
             "wg", "zerotier", "tailscale", "lo")
     nets = []
@@ -261,13 +262,20 @@ def _local_subnets(limit=6):
             plen_i = int(plen or 24)
         except ValueError:
             plen_i = 24
-        if plen_i < 24:
-            plen_i = 24
-        prefix = ".".join(ip.split(".")[:3])
-        if prefix not in nets:
-            nets.append(prefix)
-        if len(nets) >= limit:
-            break
+        try:
+            network = ipaddress.ip_interface("%s/%d" % (ip, plen_i)).network
+            if network.prefixlen < 24:
+                networks = network.subnets(new_prefix=24)
+            else:
+                networks = (network,)
+            for subnet in networks:
+                prefix = str(subnet.network_address).rsplit(".", 1)[0]
+                if prefix not in nets:
+                    nets.append(prefix)
+                if len(nets) >= limit:
+                    return nets
+        except ValueError:
+            continue
     return nets
 
 

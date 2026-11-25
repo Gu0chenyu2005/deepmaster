@@ -58,9 +58,10 @@ PY
   for name in postprocess_vla_episode.py standardize_episode_timestamps.py; do
     cp -a "$DEPLOY/scripts/$name" "$P/prog/rl_deploy/scripts/"
   done
-  for name in RoboticsServiceProcess runService.sh setting.ini epDBBackup.s3db lib plugins SDK translations; do
+  for name in RoboticsServiceProcess setting.ini epDBBackup.s3db lib plugins SDK translations; do
     cp -a "$SERVICE/$name" "$P/prog/service/"
   done
+  cp -a "$ROOT/packaging/runService.sh" "$P/prog/service/runService.sh"
   for file in "$SERVICE/"*.so*; do cp -a "$file" "$P/prog/service/"; done
   cp -a "$SRC/runtime/deploy" "$SRC/runtime/service" "$SRC/runtime/manifest.json" "$P/runtime/"
   PATCHELF="$PATCHELF_BIN" python3 "$ROOT/packaging/prepare-orin-runtime.py" "$P"

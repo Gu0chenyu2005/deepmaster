@@ -765,6 +765,7 @@ Date November 2026
   var controlQualityBad = 0;
   var controlQualityGood = 0;
   var controlQualityStats = null;
+  var controlQualityPending = false;
 
   var camHadFrame = { wrist: false, global: false, third: false };
 
@@ -1018,6 +1019,7 @@ Date November 2026
           ? samples.reduce(function (sum, value) { return sum + value; }, 0) / samples.length : null;
       };
       var fps = !stale && elapsed > 0 ? state.frames * 1000 / elapsed : 0;
+      state.latestFps = fps;
       point[cam] = [average(state.latency), average(state.intervals), fps];
       state.frames = 0;
       state.latency = [];
@@ -1373,18 +1375,54 @@ Date November 2026
     return Promise.resolve();
   }
 
+  function classifyControlVideo(serverStats, receiver) {
+    var cameras = serverStats && serverStats.cameras ? Object.values(serverStats.cameras) : [];
+    var sourceFps = cameras.reduce(function (sum, c) {
+      return sum + Number(c.source_fps || c.capture_fps || 0);
+    }, 0);
+    var publishFps = cameras.reduce(function (sum, c) {
+      return sum + Number(c.publish_fps || 0);
+    }, 0);
+    var encodeFps = cameras.reduce(function (sum, c) {
+      return sum + Number(c.encode_fps || 0);
+    }, 0);
+    var networkBad = receiver.loss > 0.04 || (receiver.rtt > 240) || (receiver.jitter > 40);
+    var sourceBad = sourceFps > 0 && cameras.some(function (c) {
+      return Number(c.capture_fps || c.source_fps || 0) < Number(c.source_fps || 0) * 0.9;
+    });
+    var publishBad = sourceFps > 0 && !sourceBad && cameras.some(function (c) {
+      return Number(c.publish_fps || 0) < Number(c.source_fps || 0) * 0.9;
+    });
+    var encodeBad = sourceFps > 0 && publishFps >= sourceFps * 0.9 &&
+      encodeFps > 0 && encodeFps < publishFps * 0.9;
+    var browserBad = sourceFps > 0 && receiver.fps < sourceFps * 0.9 &&
+      encodeFps >= sourceFps * 0.9 && !networkBad;
+    return { sourceFps: sourceFps, publishFps: publishFps, encodeFps: encodeFps,
+      networkBad: networkBad, sourceBad: sourceBad, publishBad: publishBad,
+      encodeBad: encodeBad, browserBad: browserBad,
+      reduceQuality: networkBad || encodeBad };
+  }
+
   function adaptControlVideoQuality() {
     if (!controlPeer || typeof controlPeer.getStats !== "function" || !running ||
         captureMode !== "control" || !controlPeerSession || !window.dmBridge ||
         typeof window.dmBridge.webrtcQuality !== "function") { return; }
-    Promise.resolve(controlPeer.getStats()).then(function (report) {
+    if (controlQualityPending) { return; }
+    controlQualityPending = true;
+    Promise.all([controlPeer.getStats(), window.dmBridge.webrtcStats
+      ? window.dmBridge.webrtcStats(controlPeerSession).catch(function () { return null; })
+      : Promise.resolve(null)]).then(function (results) {
+      var report = results[0];
+      var serverStats = results[1];
       var received = 0, lost = 0, frames = 0, bytes = 0, rtt = 0, rttCount = 0;
+      var jitter = 0, jitterCount = 0;
       report.forEach(function (item) {
         if (item.type === "inbound-rtp" && (item.kind === "video" || item.mediaType === "video")) {
           received += Number(item.packetsReceived || 0);
           lost += Number(item.packetsLost || 0);
           frames += Number(item.framesDecoded || 0);
           bytes += Number(item.bytesReceived || 0);
+          if (Number.isFinite(Number(item.jitter))) { jitter += Number(item.jitter) * 1000; jitterCount++; }
         } else if (item.type === "candidate-pair" && item.selected && Number(item.currentRoundTripTime) > 0) {
           rtt += Number(item.currentRoundTripTime) * 1000;
           rttCount++;
@@ -1397,8 +1435,58 @@ Date November 2026
       var fps = Math.max(0, (frames - previous.frames) / elapsed);
       var packetDelta = Math.max(0, (received - previous.received) + (lost - previous.lost));
       var loss = packetDelta ? Math.max(0, lost - previous.lost) / packetDelta : 0;
-      var bad = loss > 0.04 || fps < 18 || (rttCount && rtt / rttCount > 240) ||
-        (bytes <= previous.bytes && fps < 24);
+      if (!serverStats || !serverStats.ok || !serverStats.cameras) {
+        setRemoteStatus("采集端阶段统计暂不可用，保持当前画质", true);
+        return;
+      }
+      var diagnosis = classifyControlVideo(serverStats, {
+        loss: loss, rtt: rttCount ? rtt / rttCount : 0,
+        jitter: jitterCount ? jitter / jitterCount : 0, fps: fps
+      });
+      var cameras = serverStats && serverStats.cameras ? Object.values(serverStats.cameras) : [];
+      var sourceFps = diagnosis.sourceFps;
+      var publishFps = diagnosis.publishFps;
+      var encodeFps = diagnosis.encodeFps;
+      var networkBad = diagnosis.networkBad;
+      var encodeBad = diagnosis.encodeBad;
+      var sourceBad = diagnosis.sourceBad;
+      var publishBad = diagnosis.publishBad;
+      var browserBad = diagnosis.browserBad;
+      var stageOutput = $("#cap-stage-diagnostics");
+      if (stageOutput) {
+        var cameraNames = serverStats && serverStats.cameras ? Object.keys(serverStats.cameras) : [];
+        if (cameras.length) {
+          stageOutput.textContent = cameras.map(function (camera, index) {
+            var name = cameraNames[index] || "";
+            var viewFps = name && controlMetrics[name] ? controlMetrics[name].latestFps : null;
+            var sourceRate = Number(camera.capture_fps || 0).toFixed(0) + "/" +
+              Number(camera.source_fps || 0).toFixed(0);
+            return (name || ("相机" + (index + 1))) + " " + sourceRate + "→" +
+              (Number.isFinite(viewFps) ? viewFps.toFixed(0) : "--") + " FPS";
+          }).join(" · ") + " | " + (networkBad ? "网络拥塞" : sourceBad ? "采集瓶颈" :
+            publishBad ? "发布瓶颈" : encodeBad ? "编码瓶颈" : browserBad ? "浏览器瓶颈" : "正常");
+        } else {
+          stageOutput.textContent = "采集端阶段统计不可用";
+        }
+      }
+      if (networkBad || encodeBad) {
+        setRemoteStatus(networkBad
+          ? "网络拥塞，丢包 " + (loss * 100).toFixed(1) + "%，降低画质"
+          : "编码帧率 " + encodeFps.toFixed(0) + "/" + publishFps.toFixed(0) + " FPS，降低分辨率",
+          true);
+      } else if (sourceBad) {
+        var captureFps = cameras.reduce(function (sum, c) {
+          return sum + Number(c.capture_fps || 0);
+        }, 0);
+        setRemoteStatus("相机采集不足 " + captureFps.toFixed(0) + "/" + sourceFps.toFixed(0) + " FPS，检查曝光与 USB 链路", true);
+      } else if (publishBad) {
+        setRemoteStatus("相机帧发布低于采集速率，请检查帧交接与 appsrc", true);
+      } else if (browserBad) {
+        setRemoteStatus("浏览器解码/显示不足 " + fps.toFixed(0) + "/" + sourceFps.toFixed(0) + " FPS", true);
+      } else {
+        setRemoteStatus("三路视频状态正常", false);
+      }
+      var bad = diagnosis.reduceQuality;
       if (bad) {
         controlQualityGood = 0;
         controlQualityBad++;
@@ -1417,7 +1505,7 @@ Date November 2026
         controlQualityGood = 0;
         window.dmBridge.webrtcQuality(controlPeerSession, profiles[controlQualityIndex]).catch(function () {});
       }
-    }).catch(function () {});
+    }).catch(function () {}).finally(function () { controlQualityPending = false; });
   }
 
   function startControlVideoQuality() {
@@ -1426,6 +1514,7 @@ Date November 2026
     controlQualityBad = 0;
     controlQualityGood = 0;
     controlQualityStats = null;
+    controlQualityPending = false;
     controlQualityTimer = setInterval(adaptControlVideoQuality, 2000);
   }
 

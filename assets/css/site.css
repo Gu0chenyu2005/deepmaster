@@ -2091,6 +2091,7 @@ select.cfg__in, select.input { font-family: var(--dm-font-text); cursor: pointer
 .cap-latency__legend i { width: 7px; height: 7px; border-radius: 50%; background: #1683ff; }
 .cap-latency__legend i.is-global { background: #19a974; }
 .cap-latency__legend i.is-third { background: #e89016; }
+.cap-latency__stage { display: block; margin: -2px 0 8px; color: var(--dm-ink-2); font: 500 10px var(--dm-font-mono); font-variant-numeric: tabular-nums; }
 .cap-latency__metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .cap-latency__metric { min-width: 0; padding: 0 14px; }
 .cap-latency__metric:first-child { padding-left: 0; }

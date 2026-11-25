@@ -8,6 +8,7 @@ import time
 import unittest
 import socket
 import struct
+import threading
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orin"))
@@ -162,7 +163,7 @@ class WebRTCPreviewTests(unittest.TestCase):
         self.assertEqual(self.preview.session["quality"], "control_min")
         self.assertTrue(all(e.values == [("bitrate", 800000)] for e in encoders.values()))
         self.assertTrue(all(e.values == [(
-            "caps", "video/x-raw(memory:NVMM),format=NV12,width=320,height=240")]
+            "caps", "video/x-raw(memory:NVMM),format=NV12,width=480,height=360")]
             for e in scalers.values()))
         self.assertEqual(self.preview.set_quality("other", "control"),
                          {"ok": False, "changed": False})
@@ -188,12 +189,41 @@ class WebRTCPreviewTests(unittest.TestCase):
         }
         self.preview.readers["wrist"].source_fps = 30
 
-        self.preview.push("wrist", b"frame", 640, 480, "bgr8", 10.25)
+        self.preview._push_frame("wrist", b"frame", 640, 480, "bgr8", 10.25)
 
         self.assertEqual(source.buffers, [buffer])
         self.assertEqual(buffer.pts, 8_250_000_000)
         self.assertEqual(buffer.dts, 2**64 - 1)
         self.assertEqual(buffer.duration, 1_000_000_000 // 30)
+
+    def test_push_uses_single_latest_frame_slot(self):
+        from webrtc_preview import WebRTCPreview
+        preview = WebRTCPreview.__new__(WebRTCPreview)
+        preview.frame_conditions = {"wrist": threading.Condition()}
+        preview.frame_slots = {"wrist": (b"old", 1, 1, "bgr8", 1.0)}
+        preview.slot_overwrites = {"wrist": 0}
+        preview.push("wrist", b"new", 1, 1, "bgr8", 2.0)
+        self.assertEqual(preview.frame_slots["wrist"][0], b"new")
+        self.assertEqual(preview.slot_overwrites["wrist"], 1)
+
+    def test_stats_reports_per_camera_pipeline_counters(self):
+        reader = self.preview.readers["wrist"]
+        reader._meta = lambda: {"source_fps": 30, "measured_fps": 27.5,
+                                "frame_timeouts": 2, "capture_interval_ms": 37,
+                                "present": True, "exposure": {}, "usb": {}}
+        self.preview.readers["global"]._meta = lambda: {"source_fps": 0}
+        self.preview.readers["third"]._meta = lambda: {"source_fps": 0}
+        self.preview.session = {"id": "session", "quality": "control_low",
+                                "publish_rate": {"wrist": {"fps": 26}},
+                                "encode_rate": {"wrist": {"fps": 25}},
+                                "rtp_counts": {"wrist": 120}}
+        result = self.preview.stats("session")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["cameras"]["wrist"]["capture_fps"], 27.5)
+        self.assertEqual(result["cameras"]["wrist"]["capture_timeouts"], 2)
+        self.assertEqual(result["cameras"]["wrist"]["publish_fps"], 26)
+        self.assertEqual(result["cameras"]["wrist"]["encode_fps"], 25)
+        self.assertEqual(result["cameras"]["wrist"]["rtp_packets"], 120)
 
 
 if __name__ == "__main__":

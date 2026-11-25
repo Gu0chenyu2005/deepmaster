@@ -701,7 +701,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return self._err(401, "采集端请求未授权")
 
-        if head == "webrtc" and len(rest) == 2 and rest[1] in ("offer", "close", "quality"):
+        if head == "webrtc" and len(rest) == 2 and rest[1] in ("offer", "close", "quality", "stats"):
             body = self._body()
             session_id = str(body.get("session_id") or "")
             sdp = str(body.get("sdp") or "")
@@ -712,8 +712,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err(400, "视频质量档位无效")
             try:
                 from urllib.request import Request, urlopen
-                payload = json.dumps({"session_id": session_id, "sdp": sdp,
-                                      "profile": body.get("profile")}).encode("utf-8")
+                payload = json.dumps(body).encode("utf-8")
                 request = Request(
                     "http://127.0.0.1:%s/webrtc/%s" % (
                         STATE["cfg"].get("cam_viewer_port") or 5000, rest[1]),

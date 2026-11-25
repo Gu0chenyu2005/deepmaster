@@ -283,6 +283,39 @@ async function main() {
   assert(!delay.late(500100, 1000), 'one delayed packet must not reconnect');
   assert(!delay.late(500200, 300), 'normal delivery must clear an isolated delay');
   assert(!delay.late(500300, 1300));
+
+  const classifierScope = { Object, Number };
+  vm.createContext(classifierScope);
+  const classifierStart = source.indexOf('  function classifyControlVideo(');
+  const classifierEnd = source.indexOf('  function adaptControlVideoQuality(', classifierStart);
+  vm.runInContext(source.slice(classifierStart, classifierEnd), classifierScope);
+  const healthyCameras = Object.fromEntries(['wrist', 'global', 'third'].map(name => [name, {
+    source_fps: 30, capture_fps: 30, publish_fps: 30, encode_fps: 30
+  }]));
+  const classify = (cameras, receiver) => classifierScope.classifyControlVideo({ cameras }, receiver);
+  assert(classify(healthyCameras, { loss: 0.1, rtt: 50, jitter: 2, fps: 90 }).reduceQuality,
+    'network congestion should lower quality');
+  const slowCamera = Object.assign({}, healthyCameras, {
+    wrist: Object.assign({}, healthyCameras.wrist, { capture_fps: 20 })
+  });
+  const sourceDiagnosis = classify(slowCamera, { loss: 0, rtt: 50, jitter: 2, fps: 80 });
+  assert(sourceDiagnosis.sourceBad && !sourceDiagnosis.reduceQuality,
+    'source capture loss should be diagnosed without lowering quality');
+  const slowPublish = Object.assign({}, healthyCameras, {
+    wrist: Object.assign({}, healthyCameras.wrist, { publish_fps: 20, encode_fps: 20 })
+  });
+  const publishDiagnosis = classify(slowPublish, { loss: 0, rtt: 50, jitter: 2, fps: 80 });
+  assert(publishDiagnosis.publishBad && !publishDiagnosis.reduceQuality,
+    'frame handoff loss should not be misclassified as network congestion');
+  const slowEncoder = Object.fromEntries(['wrist', 'global', 'third'].map(name => [name, {
+    source_fps: 30, capture_fps: 30, publish_fps: 30, encode_fps: 20
+  }]));
+  assert(classify(slowEncoder, { loss: 0, rtt: 50, jitter: 2, fps: 60 }).reduceQuality,
+    'encoder overload should lower resolution');
+  const browserDiagnosis = classify(healthyCameras,
+    { loss: 0, rtt: 50, jitter: 2, fps: 50 });
+  assert(browserDiagnosis.browserBad && !browserDiagnosis.reduceQuality,
+    'browser rendering loss should be diagnosed without lowering sender quality');
   assert(!delay.late(500400, 1900));
   assert(delay.late(500500, 2500), 'sustained additional buffering must trigger recovery');
   assert(!delay.late(1000, 2600), 'a restarted source clock must establish a fresh baseline');

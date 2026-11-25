@@ -428,8 +428,10 @@ def _describe_busy(exc):
 class DirectCameraReader:
     """相机独占读取最新帧；网络与编码不阻塞相机读取线程。"""
 
-    def __init__(self, name, serial, rs):
+    def __init__(self, name, serial, rs, usb_port=""):
         self.name, self.serial, self.rs = name, serial, rs
+        self.usb_port = usb_port
+        self._usb_info = None
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
         self.jpeg = None
@@ -437,6 +439,10 @@ class DirectCameraReader:
         self.pixel_format = None
         self.width = self.height = self.seq = self.source_fps = 0
         self.fps = 0.0
+        self.frame_timeouts = 0
+        self.capture_interval_ms = None
+        self._last_capture_at = 0.0
+        self.exposure_diagnostics = {}
         self.captured_at = 0.0
         self.present = False
         self.error = "starting"
@@ -487,14 +493,38 @@ class DirectCameraReader:
                 continue
             try:
                 for sensor in active.get_device().query_sensors():
+                    sensor_options = self.exposure_diagnostics.setdefault("sensor_options", {})
                     for key, value in (("frames_queue_size", 1), ("global_time_enabled", 1),
                                        ("auto_exposure_priority", 0)):
                         option = getattr(self.rs.option, key, None)
+                        sensor_options[key] = bool(option is not None and sensor.supports(option))
                         if option is not None and sensor.supports(option):
                             try:
                                 sensor.set_option(option, value)
+                                if key == "auto_exposure_priority":
+                                    sensor_options[key + "_value"] = sensor.get_option(option)
                             except Exception:
                                 pass
+                    exposure = getattr(self.rs.option, "exposure", None)
+                    auto_limit = getattr(self.rs.option, "auto_exposure_limit", None)
+                    if exposure is not None and sensor.supports(exposure):
+                        try:
+                            self.exposure_diagnostics["exposure"] = sensor.get_option(exposure)
+                        except Exception:
+                            pass
+                    sensor_options["exposure"] = bool(exposure is not None and sensor.supports(exposure))
+                    sensor_options["auto_exposure_limit"] = bool(
+                        auto_limit is not None and sensor.supports(auto_limit))
+                    if auto_limit is not None and sensor.supports(auto_limit):
+                        try:
+                            option_range = sensor.get_option_range(auto_limit)
+                            frame_budget_ms = 1000.0 / max(1, video.fps())
+                            limit = min(option_range.max, max(option_range.min,
+                                         frame_budget_ms))
+                            sensor.set_option(auto_limit, limit)
+                            self.exposure_diagnostics["auto_exposure_limit_ms"] = limit
+                        except Exception as exc:
+                            self.exposure_diagnostics["auto_exposure_limit_error"] = str(exc)
                 first_frameset = pipeline.wait_for_frames(DIRECT_FRAME_TIMEOUT_MS)
                 if not first_frameset.get_color_frame():
                     raise RuntimeError("camera returned no color frame")
@@ -533,6 +563,7 @@ class DirectCameraReader:
                             if ("frame didn't arrive" in str(exc).lower() and
                                     frame_timeouts < DIRECT_FRAME_TIMEOUT_RETRIES):
                                 frame_timeouts += 1
+                                self.frame_timeouts += 1
                                 continue
                             raise
                         frame_timeouts = 0
@@ -540,6 +571,9 @@ class DirectCameraReader:
                     if not frame:
                         continue
                     captured_at = time.monotonic()
+                    if self._last_capture_at:
+                        self.capture_interval_ms = round((captured_at - self._last_capture_at) * 1000, 1)
+                    self._last_capture_at = captured_at
                     data = bytes(frame.get_data())
                     frames += 1
                     with self.condition:
@@ -584,7 +618,26 @@ class DirectCameraReader:
                 "width": self.width, "height": self.height, "fps": self.source_fps,
                 "source_fps": self.source_fps, "seq": self.seq, "measured_fps": self.fps,
                 "captured_at": self.captured_at, "age_ms": age,
+                "frame_timeouts": self.frame_timeouts,
+                "capture_interval_ms": self.capture_interval_ms,
+                "exposure": dict(self.exposure_diagnostics),
+                "usb": self._usb_diagnostics(),
                 "error": self.error or ("camera stalled" if not present else "")}
+
+    def _usb_diagnostics(self):
+        if self._usb_info is not None:
+            return dict(self._usb_info)
+        result = {"topology": self.usb_port or "unknown", "speed_mbps": None}
+        if not self.usb_port:
+            self._usb_info = result
+            return result
+        try:
+            speed_path = Path("/sys/bus/usb/devices") / self.usb_port / "speed"
+            result["speed_mbps"] = int(float(speed_path.read_text().strip()))
+        except (OSError, ValueError):
+            pass
+        self._usb_info = result
+        return result
 
     def _placeholder(self):
         if self._placeholder_cache is None:
@@ -656,7 +709,11 @@ class DirectCameraReader:
             return {"segment": self.name, "present": meta["present"], "label": self.name,
                     "size": f"{self.width}x{self.height}" if self.width else "-",
                     "fps_header": self.source_fps, "fps_measured": self.fps,
-                    "seq": self.seq, "age_ms": meta["age_ms"], "error": meta["error"]}
+                    "seq": self.seq, "age_ms": meta["age_ms"], "error": meta["error"],
+                    "frame_timeouts": self.frame_timeouts,
+                    "capture_interval_ms": self.capture_interval_ms,
+                    "exposure": dict(self.exposure_diagnostics),
+                    "usb": self._usb_diagnostics()}
 
 
 def normalize_camera_port(port):
@@ -711,7 +768,7 @@ def direct_camera_segments():
     for role in roles:
         if roles[role] is None and unused:
             roles[role] = unused.pop(0)
-    return [DirectCameraReader(role, roles[role]["serial"], rs)
+    return [DirectCameraReader(role, roles[role]["serial"], rs, roles[role]["port"])
             for role in ("primary", "third", "d435i")]
 
 
@@ -815,7 +872,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path not in ("/webrtc/offer", "/webrtc/close", "/webrtc/quality") or WEBRTC is None:
+        if parsed.path not in ("/webrtc/offer", "/webrtc/close", "/webrtc/quality", "/webrtc/stats") or WEBRTC is None:
             return self._send(404, "application/json", b'{"error":"not found"}')
         supplied = self.headers.get("X-DM-WebRTC-Token", "")
         if not WEBRTC_TOKEN or not hmac.compare_digest(supplied, WEBRTC_TOKEN):
@@ -829,6 +886,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = WEBRTC.offer(body)
             elif parsed.path.endswith("quality"):
                 result = WEBRTC.set_quality(body.get("session_id"), body.get("profile"))
+            elif parsed.path.endswith("stats"):
+                result = WEBRTC.stats(body.get("session_id"))
             else:
                 result = WEBRTC.close(str(body.get("session_id") or ""))
             encoded = json.dumps(result, ensure_ascii=False).encode()

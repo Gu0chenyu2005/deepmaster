@@ -6,14 +6,14 @@
 
 足臂机器人数据采集与审核平台。DeepMaster 将网页服务、采集端设备代理和浏览器操作界面分开部署，用于设备管理、三相机预览、遥操作采集、数据清洗、审核和数据集导出。
 
-当前版本：`v3.1.0`
+当前版本：`v3.2.0`
 
 ## 功能
 
 - **设备管理**：管理在线采集端、设备配置和配对状态。服务端与采集端版本必须一致才能配对。
 - **近控采集**：沿用现有采集流程，在本地网络下预览相机并录制数据。
 - **远控采集**：浏览器查看三路相机画面并进行远程操作；预览媒体直接从采集端发送到浏览器，服务端负责登录保护、信令和任务协调。
-- **远控仅控制**：只启动遥操作和相机预览，不创建录制任务。三路 H.264 视频通过 WebRTC 从采集端直达浏览器；系统根据丢包、延迟和解码帧率动态调整画质，网络恢复后逐步恢复画质，优先维持流畅帧率。
+- **远控仅控制**：只启动遥操作和相机预览，不创建录制任务。三路 H.264 视频通过 WebRTC 从采集端直达浏览器；页面展示采集、发布、编码和浏览器呈现帧率，并区分网络、相机、编码及浏览器瓶颈。系统仅在网络拥塞或编码受限时动态调整画质。
 - **数据审核**：按 episode 查看三路相机画面、帧时间轴和机器人状态曲线；支持任务分段、单条及批量审核。
 - **数据入库清洗**：上传入库时去除相机首帧黑屏和冻结帧，并对相关数据序列使用相同的保留帧索引，保持时间戳对齐。
 - **LeRobot 导出**：从审核结果中导出标记为合格的数据，原始采集端文件不会因此被删除。
@@ -57,7 +57,7 @@ flowchart LR
 GitHub Release 提供源代码压缩包，不附带预编译的服务端包或采集端包。服务端部署包可从源码构建：
 
 ```bash
-tar -xf deepmaster-3.1.0.tar.gz
+tar -xf deepmaster-3.2.0.tar.gz
 cd deepmaster
 ./make-packages.sh server
 ```
@@ -68,7 +68,7 @@ cd deepmaster
 DM_PROGRAM_SOURCE=/path/to/orin-progs ./make-packages.sh orin
 ```
 
-脚本检查所需程序、运行库及 ARM64 运行时后生成 `dist/orin-collect-v3.1.0-*.tar.zst`。服务端生成 `dist/server-review-v3.1.0-*.tar.gz`。构建成功后，分别按照 [`packaging/README-server.md`](packaging/README-server.md) 和 [`packaging/README-orin.md`](packaging/README-orin.md) 安装；服务端网页默认端口为 `8790`，API 默认端口为 `8765`，采集端代理端口由设备发现与配置确定。
+脚本检查所需程序、运行库及 ARM64 运行时后生成 `dist/orin-collect-v3.2.0-*.tar.zst`。服务端生成 `dist/server-review-v3.2.0-*.tar.gz`。构建成功后，分别按照 [`packaging/README-server.md`](packaging/README-server.md) 和 [`packaging/README-orin.md`](packaging/README-orin.md) 安装；服务端网页默认端口为 `8790`，API 默认端口为 `8765`，采集端代理端口由设备发现与配置确定。
 
 ## 测试
 

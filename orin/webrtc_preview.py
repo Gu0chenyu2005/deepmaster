@@ -116,6 +116,57 @@ class WebRTCPreview:
         self.monitor_thread = None
         self.monitor_started = False
         self._last_connection_log = None
+        self.frame_conditions = {name: threading.Condition() for name in self.readers}
+        self.frame_slots = {name: None for name in self.readers}
+        self.slot_overwrites = {name: 0 for name in self.readers}
+        self.slot_threads = []
+        for name in self.readers:
+            thread = threading.Thread(target=self._consume_frames, args=(name,),
+                                      name="webrtc-push-" + name, daemon=True)
+            thread.start()
+            self.slot_threads.append(thread)
+
+    def _consume_frames(self, name):
+        condition = self.frame_conditions[name]
+        while True:
+            with condition:
+                condition.wait_for(lambda: self.frame_slots[name] is not None)
+                item, self.frame_slots[name] = self.frame_slots[name], None
+            self._push_frame(name, *item)
+
+    def _stage_frame_rate(self, values, name, now):
+        sample = values.setdefault(name, {"count": 0, "at": now, "fps": 0.0})
+        sample["count"] += 1
+        elapsed = now - sample["at"]
+        if elapsed >= 1.0:
+            sample["fps"] = round(sample["count"] / elapsed, 1)
+            sample["count"], sample["at"] = 0, now
+        return sample["fps"]
+
+    def stats(self, session_id):
+        with self.lock:
+            state = self.session
+            if not state or state.get("id") != str(session_id or ""):
+                return {"ok": False, "cameras": {}}
+            now = time.monotonic()
+            cameras = {}
+            for name, reader in self.readers.items():
+                meta = reader._meta()
+                cameras[name] = {
+                    "source_fps": meta.get("source_fps", 0),
+                    "capture_fps": meta.get("measured_fps", 0),
+                    "capture_timeouts": meta.get("frame_timeouts", 0),
+                    "capture_interval_ms": meta.get("capture_interval_ms"),
+                    "queue_overwrites": self.slot_overwrites.get(name, 0),
+                    "publish_fps": state.get("publish_rate", {}).get(name, {}).get("fps", 0),
+                    "encode_fps": state.get("encode_rate", {}).get(name, {}).get("fps", 0),
+                    "rtp_packets": state.get("rtp_counts", {}).get(name, 0),
+                    "present": meta.get("present", False),
+                    "exposure": meta.get("exposure", {}),
+                    "usb": meta.get("usb", {}),
+                }
+            return {"ok": True, "quality": state.get("quality", "control"),
+                    "cameras": cameras, "sampled_at": now}
 
     def _load(self):
         if self.gst:
@@ -207,8 +258,10 @@ class WebRTCPreview:
             for encoder in state.get("encoders", {}).values():
                 encoder.set_property("bitrate", bitrate)
             for scaler, source_size in state.get("scalers", {}).values():
-                width = max(320, int(source_size[0] * scale) // 2 * 2)
-                height = max(240, int(source_size[1] * scale) // 2 * 2)
+                floor_scale = min(1.0, 640 / source_size[0], 360 / source_size[1])
+                effective_scale = max(scale, floor_scale)
+                width = max(2, int(source_size[0] * effective_scale) // 2 * 2)
+                height = max(2, int(source_size[1] * effective_scale) // 2 * 2)
                 caps = self.gst.Caps.from_string(
                     "video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d" %
                     (width, height))
@@ -272,6 +325,10 @@ class WebRTCPreview:
                 if time.monotonic() - self.session["touched"] < 30:
                     raise RuntimeError("远控仅控制视频已有连接")
                 self._close_locked(self.session["id"])
+            for name, condition in self.frame_conditions.items():
+                with condition:
+                    self.frame_slots[name] = None
+                    self.slot_overwrites[name] = 0
             self._load()
             remote, codecs = self._parse_offer(offer)
             self.session = {"id": session_id, "touched": time.monotonic(),
@@ -279,6 +336,7 @@ class WebRTCPreview:
                             "sources": {}, "encoders": {}, "scalers": {},
                             "rtp_pads": {}, "pc": None,
                             "frame_counts": {}, "rtp_counts": {}, "last_stats_log": 0,
+                            "publish_rate": {}, "encode_rate": {},
                             "quality": "control"}
             try:
                 self._build_pipeline(codecs)
@@ -386,6 +444,13 @@ class WebRTCPreview:
                 return gst.PadProbeReturn.OK
 
             src_pad.add_probe(gst.PadProbeType.BUFFER, count_rtp)
+            encoded_pad = parser.get_static_pad("src")
+
+            def count_encoded(_pad, _info, _state=state, _name=name):
+                self._stage_frame_rate(_state["encode_rate"], _name, time.monotonic())
+                return gst.PadProbeReturn.OK
+
+            encoded_pad.add_probe(gst.PadProbeType.BUFFER, count_encoded)
             sink = pc.request_pad_simple("sink_%u")
             if sink is None or src_pad.link(sink) != gst.PadLinkReturn.OK:
                 raise RuntimeError("无法添加 %s 视频轨道" % name)
@@ -430,6 +495,16 @@ class WebRTCPreview:
                 "type": "answer"}
 
     def push(self, name, data, width, height, pixel_format, captured_at):
+        if name not in self.frame_conditions:
+            return
+        condition = self.frame_conditions[name]
+        with condition:
+            if self.frame_slots[name] is not None:
+                self.slot_overwrites[name] += 1
+            self.frame_slots[name] = (data, width, height, pixel_format, captured_at)
+            condition.notify()
+
+    def _push_frame(self, name, data, width, height, pixel_format, captured_at):
         state = self.session
         if not state or name not in state["sources"]:
             return
@@ -458,6 +533,7 @@ class WebRTCPreview:
             result = src.emit("push-buffer", buffer)
             if result == self.gst.FlowReturn.OK:
                 state["frame_counts"][name] = state["frame_counts"].get(name, 0) + 1
+                self._stage_frame_rate(state["publish_rate"], name, time.monotonic())
             elif result not in (None, self.gst.FlowReturn.FLUSHING):
                 print("[webrtc] %s appsrc=%s" % (name, result), flush=True)
         except Exception:

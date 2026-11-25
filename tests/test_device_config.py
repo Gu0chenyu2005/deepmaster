@@ -305,6 +305,14 @@ class DeviceConfigTests(unittest.TestCase):
             self.assertEqual(received[0][0], "/webrtc/offer")
             self.assertEqual(received[0][1], "w" * 48)
             self.assertEqual(received[0][2]["sdp"], "offer")
+            stats_base = base.rsplit("/", 1)[0] + "/stats"
+            stats_request = urllib.request.Request(
+                stats_base, data=json.dumps({"session_id": "s"}).encode(),
+                headers={"Content-Type": "application/json", "X-DM-Token": "a" * 48})
+            with urllib.request.urlopen(stats_request) as response:
+                self.assertEqual(json.load(response)["data"]["type"], "answer")
+            self.assertEqual(received[1][0], "/webrtc/stats")
+            self.assertEqual(received[1][2]["session_id"], "s")
         finally:
             server.shutdown()
             server.server_close()

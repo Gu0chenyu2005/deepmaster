@@ -3273,7 +3273,7 @@ class Handler(BaseHTTPRequestHandler):
                                             body.get("status"),
                                             body.get("comment"), user))
 
-        if head == "webrtc" and len(rest) >= 2 and rest[1] in ("offer", "close", "quality"):
+        if head == "webrtc" and len(rest) >= 2 and rest[1] in ("offer", "close", "quality", "stats"):
             user = self._user(required=True, min_role="user")
             body = self._body()
             if not isinstance(body, dict):
@@ -3289,8 +3289,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise err400("WebRTC 直连预览需要在线采集端")
             try:
                 result = _agent_call("/api/webrtc/" + rest[1],
-                                     {"session_id": session_id, "sdp": sdp,
-                                      "profile": body.get("profile")},
+                                     body,
                                      timeout=20)
             except AgentDown as exc:
                 return self._send(503, {"code": 503, "message": str(exc),

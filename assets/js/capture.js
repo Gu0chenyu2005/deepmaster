@@ -1500,7 +1500,9 @@ Date November 2026
         controlQualityBad = 0;
         setRemoteStatus("网络拥塞，降低画质以保持帧率", true);
         window.dmBridge.webrtcQuality(controlPeerSession, profiles[controlQualityIndex]).catch(function () {});
-      } else if (controlQualityGood >= 8 && controlQualityIndex > 0) {
+      } else if (controlQualityGood >= 8 && controlQualityIndex > 0 &&
+          !networkBad && !encodeBad && !sourceBad && !publishBad && !browserBad &&
+          fps >= Math.max(1, sourceFps * 0.9)) {
         controlQualityIndex--;
         controlQualityGood = 0;
         window.dmBridge.webrtcQuality(controlPeerSession, profiles[controlQualityIndex]).catch(function () {});
@@ -1510,7 +1512,8 @@ Date November 2026
 
   function startControlVideoQuality() {
     if (controlQualityTimer) { clearInterval(controlQualityTimer); }
-    controlQualityIndex = 0;
+    // Start at minimum quality to avoid an initial three-stream bitrate spike.
+    controlQualityIndex = CONTROL_PROFILES.length - 1;
     controlQualityBad = 0;
     controlQualityGood = 0;
     controlQualityStats = null;
@@ -1717,7 +1720,9 @@ Date November 2026
     }).then(function (answer) {
       if (!answer || answer.type !== "answer" || !answer.sdp) { throw new Error("采集端返回的 SDP answer 无效"); }
       midMap = parseVideoMids(answer.sdp);
-      return peer.setRemoteDescription({ type: answer.type, sdp: answer.sdp });
+      return peer.setRemoteDescription({ type: answer.type, sdp: answer.sdp }).then(function () {
+        return window.dmBridge.webrtcQuality(controlPeerSession, "control_min").catch(function () {});
+      });
     }).catch(function (error) {
       if (!running || generation !== previewGeneration) { return; }
       scheduleControlReconnect(cfg, generation);

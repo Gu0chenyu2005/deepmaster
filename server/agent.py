@@ -30,7 +30,7 @@ import cam        # noqa: E402
 import runner     # noqa: E402
 import system     # noqa: E402
 
-VERSION = "3.2.0"
+VERSION = "3.2.1-beta"
 
 STATUS_PATTERNS = {
     "k7master3": ["K7Master3"],

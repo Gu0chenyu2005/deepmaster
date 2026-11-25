@@ -12,7 +12,8 @@ import threading
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orin"))
-from webrtc_preview import WebRTCPreview, LocalStunServer, prefer_numeric_candidates
+from webrtc_preview import (WebRTCPreview, LocalStunServer, prefer_numeric_candidates,
+                            quality_dimensions)
 
 
 class LocalStunTests(unittest.TestCase):
@@ -72,6 +73,11 @@ class WebRTCPreviewTests(unittest.TestCase):
         self.assertEqual(list(self.preview.readers), ["wrist", "global", "third"])
         self.assertIs(self.preview.readers["wrist"], self.readers[0])
         self.assertIs(self.preview.readers["global"], self.readers[2])
+
+    def test_minimum_quality_keeps_at_least_640_by_360_when_source_allows(self):
+        self.assertEqual(quality_dimensions(1280, 720, 0.5), (640, 360))
+        self.assertEqual(quality_dimensions(848, 480, 0.5), (640, 362))
+        self.assertEqual(quality_dimensions(640, 480, 0.5), (640, 480))
 
     def test_offer_rejects_invalid_and_oversized_sessions(self):
         with self.assertRaises(ValueError):
@@ -163,7 +169,7 @@ class WebRTCPreviewTests(unittest.TestCase):
         self.assertEqual(self.preview.session["quality"], "control_min")
         self.assertTrue(all(e.values == [("bitrate", 800000)] for e in encoders.values()))
         self.assertTrue(all(e.values == [(
-            "caps", "video/x-raw(memory:NVMM),format=NV12,width=480,height=360")]
+            "caps", "video/x-raw(memory:NVMM),format=NV12,width=640,height=480")]
             for e in scalers.values()))
         self.assertEqual(self.preview.set_quality("other", "control"),
                          {"ok": False, "changed": False})

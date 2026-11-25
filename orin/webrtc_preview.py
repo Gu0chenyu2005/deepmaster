@@ -19,6 +19,15 @@ QUALITY_PROFILES = {
 }
 
 
+def quality_dimensions(width, height, scale):
+    """Return even output dimensions while retaining the 640x360 floor."""
+    width, height = max(2, int(width)), max(2, int(height))
+    floor = min(1.0, max(640 / width, 360 / height))
+    effective = max(float(scale), floor)
+    return (max(2, int(width * effective) // 2 * 2),
+            max(2, int(height * effective) // 2 * 2))
+
+
 def prefer_numeric_candidates(text):
     sections = []
     for line in text.splitlines():
@@ -258,10 +267,7 @@ class WebRTCPreview:
             for encoder in state.get("encoders", {}).values():
                 encoder.set_property("bitrate", bitrate)
             for scaler, source_size in state.get("scalers", {}).values():
-                floor_scale = min(1.0, 640 / source_size[0], 360 / source_size[1])
-                effective_scale = max(scale, floor_scale)
-                width = max(2, int(source_size[0] * effective_scale) // 2 * 2)
-                height = max(2, int(source_size[1] * effective_scale) // 2 * 2)
+                width, height = quality_dimensions(*source_size, scale)
                 caps = self.gst.Caps.from_string(
                     "video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d" %
                     (width, height))
@@ -337,7 +343,8 @@ class WebRTCPreview:
                             "rtp_pads": {}, "pc": None,
                             "frame_counts": {}, "rtp_counts": {}, "last_stats_log": 0,
                             "publish_rate": {}, "encode_rate": {},
-                            "quality": "control"}
+                            # Start at the minimum bitrate; the browser raises quality after stability checks.
+                            "quality": "control_min"}
             try:
                 self._build_pipeline(codecs)
                 return self._answer(remote)
@@ -396,15 +403,14 @@ class WebRTCPreview:
                 pipeline.add(element)
                 chain.append(element)
             capsfilter = gst.ElementFactory.make("capsfilter", "nv12-" + name)
+            initial_bitrate, initial_scale = QUALITY_PROFILES["control_min"]
+            output_width, output_height = quality_dimensions(width, height, initial_scale)
             capsfilter.set_property("caps", gst.Caps.from_string(
-                "video/x-raw(memory:NVMM),format=NV12"))
+                "video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d" %
+                (output_width, output_height)))
             encoder = gst.ElementFactory.make("nvv4l2h264enc", "h264-" + name)
             encoder.set_property("profile", int(profile == "constrained-baseline"))
-            try:
-                bitrate = int(os.environ.get("DM_WEBRTC_VIDEO_BITRATE", "2000000"))
-            except ValueError:
-                bitrate = 2000000
-            encoder.set_property("bitrate", max(500000, min(bitrate, 6000000)))
+            encoder.set_property("bitrate", initial_bitrate)
             encoder.set_property("control-rate", 1)
             encoder.set_property("iframeinterval", 30)
             encoder.set_property("insert-sps-pps", True)

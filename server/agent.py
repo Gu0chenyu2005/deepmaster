@@ -30,7 +30,7 @@ import cam        # noqa: E402
 import runner     # noqa: E402
 import system     # noqa: E402
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 STATUS_PATTERNS = {
     "k7master3": ["K7Master3"],
@@ -352,6 +352,51 @@ def start_api(port):
     return None
 
 
+def _camera_holders():
+    nodes = sorted(glob.glob("/dev/video[0-9]*"))
+    if not nodes:
+        return set()
+    lsof = shutil.which("lsof")
+    if not lsof:
+        raise RuntimeError("缺少 lsof，请安装后重试")
+    if os.geteuid() != 0:
+        raise RuntimeError("相机占用清理需要管理员权限")
+    result = subprocess.run([lsof, "-w", "-t", "--", *nodes],
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode not in (0, 1) or (result.returncode == 1 and result.stderr.strip()):
+        raise RuntimeError("相机占用扫描失败")
+    return {int(line) for line in result.stdout.splitlines() if line.strip().isdigit()}
+
+
+def _release_camera_devices():
+    """释放相机占用；运行中的机器人程序必须通过正常退出流程处理。"""
+    try:
+        holders = _camera_holders()
+        protected = {os.getpid(), os.getppid(), 1}
+        protected.update(runner.find_pids(["rl_deploy", "RoboticsServiceProcess", "K7Master3"]))
+        if holders & protected:
+            return {"ok": False, "error": "相机被控制程序占用，请先结束当前采集或控制"}
+        for sig, timeout in ((signal.SIGTERM, 2.0), (signal.SIGKILL, 2.0)):
+            for pid in holders:
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+            deadline = time.monotonic() + timeout
+            while holders:
+                holders &= _camera_holders()
+                if not holders or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.1)
+            if not holders:
+                break
+        if _camera_holders():
+            return {"ok": False, "error": "相机占用未释放，请关闭占用程序后重试"}
+        return {"ok": True}
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": str(exc) if isinstance(exc, RuntimeError) else "相机占用清理失败"}
+
+
 @runner.serialized_operation
 def start_cam_viewer(mode="shm"):
     """启动共享内存或直连相机预览服务。"""
@@ -382,10 +427,12 @@ def start_cam_viewer(mode="shm"):
                 return {"ok": False, "error": "远控需要三台 RealSense，当前识别到 %d 台，请检查 USB 连接和供电" % count}
         except (OSError, subprocess.TimeoutExpired, ValueError, IndexError) as exc:
             return {"ok": False, "error": "相机设备检查失败：%s" % exc}
-    if STATE.get("cam_mode") != mode:
-        stopped = runner.stop(STATE["cam_key"])
-        if not stopped.get("ok"):
-            return stopped
+    stopped = runner.stop(STATE["cam_key"])
+    if not stopped.get("ok"):
+        return stopped
+    released = _release_camera_devices()
+    if not released.get("ok"):
+        return released
     cmd = [sys.executable, script, "--port", port]
     cmd.append("--direct" if mode in ("direct", "direct-webrtc") else "--auto")
     env = {}

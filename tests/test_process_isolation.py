@@ -40,6 +40,7 @@ class ProcessIsolationTests(unittest.TestCase):
              patch.object(agent, "_direct_camera_command", side_effect=lambda cmd: cmd), \
              patch.object(agent.runner, "_validate_control_scheduling", return_value={"ok": True}), \
              patch.object(agent.runner, "stop", return_value={"ok": True}), \
+             patch.object(agent, "_release_camera_devices", return_value={"ok": True}), \
              patch.object(agent.runner, "spawn", return_value={"ok": True}) as spawn:
             result = agent.start_cam_viewer("direct-webrtc")
         self.assertTrue(result["ok"])

@@ -11,9 +11,9 @@ for file in agent/agent.py agent/runner.py agent/cam.py agent/system.py host_con
   cam/camera_shm_viewer.py cam/webrtc_preview.py; do
   [ -f "$ROOT/$file" ] || { echo "缺少 $ROOT/$file" >&2; exit 1; }
 done
-if ! python3 -c 'import h5py, numpy, cv2' 2>/dev/null || ! command -v ssh >/dev/null || ! command -v sshpass >/dev/null; then
+if ! python3 -c 'import h5py, numpy, cv2' 2>/dev/null || ! command -v ssh >/dev/null || ! command -v sshpass >/dev/null || ! command -v lsof >/dev/null; then
   apt-get update
-  apt-get install -y python3 python3-h5py python3-numpy python3-opencv openssh-client sshpass
+  apt-get install -y python3 python3-h5py python3-numpy python3-opencv openssh-client sshpass lsof
 fi
 if ! dpkg-query -W -f='${Status}' gstreamer1.0-plugins-bad 2>/dev/null | grep -q 'install ok installed' || \
    ! gst-inspect-1.0 webrtcbin >/dev/null 2>&1 || \

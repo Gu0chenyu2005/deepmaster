@@ -119,7 +119,9 @@ RGBD_STREAM_PAIRS = (
 )
 
 
-_RESERVED_OUTPUT_DIR_NAMES = frozenset({"passed", "pending", "json", "valid", "合格", "待复审"})
+_RESERVED_OUTPUT_DIR_NAMES = frozenset({
+    "passed", "pending", "json", "valid", "auto_qc", "合格", "待复审"
+})
 _RESERVED_OUTPUT_SUFFIXES = ("_passed", "_pending")
 def check_deps():
     """检查运行依赖。"""
@@ -1852,8 +1854,8 @@ def _discover_target_folders(input_dir, custom_mode=False, dry_run=False, copy_m
         if is_record_folder(d):
             if find_hdf5_files(src_path):
                 targets.append((d, src_path))
-            elif not dry_run and not copy_mode:
-                shutil.rmtree(src_path, ignore_errors=True)
+            # Empty record directories are left for the caller to clean up.
+            # The scanner must never delete input data merely because it has no HDF5 yet.
         elif custom_mode and find_hdf5_files(src_path):
             targets.append((d, src_path))
 

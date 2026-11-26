@@ -17,14 +17,19 @@ def db_path():
 
 @contextmanager
 def connect():
-    """创建独立 SQLite 连接，使用自动提交。"""
-    conn = sqlite3.connect(db_path(), timeout=15, isolation_level=None)
+    """创建连接；上下文退出时统一提交或回滚。"""
+    conn = sqlite3.connect(db_path(), timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=15000")
     try:
         yield conn
+    except BaseException:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
     finally:
         conn.close()
 

@@ -1,6 +1,7 @@
 """控制互斥、配置脱敏及代理错误回归。"""
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -12,12 +13,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'server'))
 import agent
 import cam
 import runner
+import db
+import auto_qc
 with patch.object(sys, 'argv', ['api.py']):
     import api
     import run_web
 
 
 class ReviewFixTests(unittest.TestCase):
+    def test_data_reads_require_login_but_health_is_public(self):
+        handler = object.__new__(api.Handler)
+        handler._user = Mock(side_effect=PermissionError("login required"))
+        with self.assertRaises(PermissionError):
+            handler._route_get(["dirs"], {})
+        handler._user.reset_mock()
+        with patch.object(handler, "_ok", return_value={"ok": True}) as health:
+            handler._route_get(["health"], {})
+        health.assert_called_once()
+        handler._user.assert_not_called()
+
+    def test_sqlite_context_rolls_back_on_exception(self):
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+                os.environ, {"DM_DB": str(Path(root) / "test.db")}):
+            with db.connect() as conn:
+                conn.execute("CREATE TABLE t (value TEXT)")
+            with self.assertRaisesRegex(RuntimeError, "abort"):
+                with db.connect() as conn:
+                    conn.execute("INSERT INTO t(value) VALUES ('discarded')")
+                    raise RuntimeError("abort")
+            with db.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM t").fetchone()[0], 0)
+
+    def test_auto_qc_directory_is_reserved_and_empty_records_are_kept(self):
+        self.assertTrue(auto_qc._is_reserved_output_folder("auto_qc"))
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root) / "record_data_20261126_1"
+            folder.mkdir()
+            self.assertEqual(auto_qc._discover_target_folders(root), [])
+            self.assertTrue(folder.exists())
+
     def test_review_data_resolution_stays_inside_configured_dataset_root(self):
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp) / 'project'

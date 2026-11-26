@@ -253,7 +253,7 @@ class WebRTCPreview:
                 pass
 
     def set_quality(self, session_id, profile):
-        """调整当前会话码率，保持连接和源帧率不变。"""
+        """调整码率；默认不在线重建 caps，避免 GStreamer 热改分辨率崩溃。"""
         profile = str(profile or "")
         settings = QUALITY_PROFILES.get(profile)
         if not settings:
@@ -266,12 +266,16 @@ class WebRTCPreview:
             previous = state.get("quality", "control")
             for encoder in state.get("encoders", {}).values():
                 encoder.set_property("bitrate", bitrate)
-            for scaler, source_size in state.get("scalers", {}).values():
-                width, height = quality_dimensions(*source_size, scale)
-                caps = self.gst.Caps.from_string(
-                    "video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d" %
-                    (width, height))
-                scaler.set_property("caps", caps)
+            # A caps change while PLAYING can leave nvvidconv/encoder in an
+            # invalid state. Resolution changes are therefore opt-in and must
+            # be coordinated by a full pipeline restart.
+            if state.get("allow_hot_resize", True):
+                for scaler, source_size in state.get("scalers", {}).values():
+                    width, height = quality_dimensions(*source_size, scale)
+                    caps = self.gst.Caps.from_string(
+                        "video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d" %
+                        (width, height))
+                    scaler.set_property("caps", caps)
             state["quality"] = profile
             state["touched"] = time.monotonic()
             if previous != profile:
@@ -344,7 +348,9 @@ class WebRTCPreview:
                             "frame_counts": {}, "rtp_counts": {}, "last_stats_log": 0,
                             "publish_rate": {}, "encode_rate": {},
                             # Start at the minimum bitrate; the browser raises quality after stability checks.
-                            "quality": "control_min"}
+                            "quality": "control_min",
+                            "allow_hot_resize": False,
+                            "sinks": []}
             try:
                 self._build_pipeline(codecs)
                 return self._answer(remote)
@@ -462,6 +468,7 @@ class WebRTCPreview:
                 raise RuntimeError("无法添加 %s 视频轨道" % name)
             transceiver = sink.get_property("transceiver")
             transceiver.set_property("direction", self.webrtc.WebRTCRTPTransceiverDirection.SENDONLY)
+            state["sinks"].append(sink)
             state["sources"][name] = (src, fmt, width, height)
             state["frame_counts"][name] = 0
             state["encoders"][name] = encoder
@@ -557,9 +564,24 @@ class WebRTCPreview:
             return {"closed": False}
         self.session = None
         try:
+            pc = state.get("pc")
+            if pc is not None:
+                for sink in state.get("sinks", []):
+                    try:
+                        pc.release_request_pad(sink)
+                    except Exception:
+                        pass
             state["pipeline"].set_state(self.gst.State.NULL)
+            get_state = getattr(state["pipeline"], "get_state", None)
+            if get_state is not None:
+                get_state(2 * self.gst.SECOND)
         except Exception:
             pass
+        for name, condition in self.frame_conditions.items():
+            with condition:
+                self.frame_slots[name] = None
+                condition.notify_all()
+        state.clear()
         return {"closed": True}
 
 

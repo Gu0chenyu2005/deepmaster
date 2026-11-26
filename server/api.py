@@ -3027,6 +3027,10 @@ class Handler(BaseHTTPRequestHandler):
         if head == "health":
             return self._ok({"ok": True, "time": db.now(), "version": APP_VERSION})
 
+        # Health is the only public read endpoint. All data, device and system
+        # information requires a logged-in user before dispatch.
+        self._user(required=True, min_role="user")
+
         if head == "preflight":
             d = (q.get("dir") or [""])[0]
             if agent_on():
@@ -3162,6 +3166,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
         if head == "auth" and len(rest) >= 2 and rest[1] == "register":
+            if os.environ.get("DM_ALLOW_REGISTER") != "1":
+                raise err403("注册功能已关闭")
             body = self._body()
             acc = (body.get("account") or "").strip()
             pwd = body.get("password") or ""

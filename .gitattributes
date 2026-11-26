@@ -1,0 +1,5 @@
+server/.secret export-ignore
+server/*.db export-ignore
+server/*.db-* export-ignore
+logs/ export-ignore
+__pycache__/ export-ignore

@@ -51,7 +51,7 @@ TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(TOOL_DIR)
 
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.3.1"
 DEFAULT_DATA = os.environ.get("DM_DATA_DIR", os.path.join(PROJECT_DIR, "datasets"))
 _pos = [a for a in sys.argv[1:] if not a.startswith("-")]
 INIT_DATA = os.path.abspath(_pos[0]) if _pos else DEFAULT_DATA
@@ -1893,7 +1893,21 @@ def op_review_save(dir_path, episode, status=None, comment=None, segments=None, 
         raise err400("status 必须是 good / bad / pending / 空")
     rel = rel_to_data(d)
 
-    with db.connect() as conn:
+    clean_segments = None
+    if segments is not None:
+        if not isinstance(segments, list):
+            raise err400("segments 必须是 list 或 null")
+        clean_segments = []
+        for segment in segments:
+            try:
+                start, end = int(segment["from"]), int(segment["to"])
+            except (KeyError, TypeError, ValueError):
+                raise err400("segments 元素需要 from / to 整数")
+            label = segment.get("label")
+            clean_segments.append((start, end, (str(label).strip() or None) if label else None))
+        clean_segments.sort(key=lambda item: item[0])
+
+    with db.transaction() as conn:
         row = conn.execute("SELECT * FROM reviews WHERE dir_path=? AND episode=?",
                            (rel, episode)).fetchone()
         cur_status = row["status"] if row else ""
@@ -1909,21 +1923,10 @@ def op_review_save(dir_path, episode, status=None, comment=None, segments=None, 
             (rel, episode, new_status, new_comment, db.now(),
              user["account"] if user else None))
 
-        if segments is not None:
-            if not isinstance(segments, list):
-                raise err400("segments 必须是 list 或 null")
+        if clean_segments is not None:
             conn.execute("DELETE FROM segments WHERE dir_path=? AND episode=?",
                          (rel, episode))
-            clean = []
-            for sg in segments:
-                try:
-                    frm, to = int(sg["from"]), int(sg["to"])
-                except Exception:
-                    raise err400("segments 元素需要 from / to 整数")
-                lbl = sg.get("label")
-                clean.append((frm, to, (str(lbl).strip() or None) if lbl else None))
-            clean.sort(key=lambda s: s[0])
-            for i, (frm, to, lbl) in enumerate(clean):
+            for i, (frm, to, lbl) in enumerate(clean_segments):
                 conn.execute(
                     "INSERT INTO segments(dir_path, episode, seq, from_frame, to_frame, label) "
                     "VALUES (?,?,?,?,?,?)", (rel, episode, i, frm, to, lbl))
@@ -1947,7 +1950,7 @@ def op_review_batch(dir_path, episodes, status, comment=None, user=None):
     rel = rel_to_data(d)
 
     done, missing = [], []
-    with db.connect() as conn:
+    with db.transaction() as conn:
         for ep in episodes:
             try:
                 ep = int(ep)

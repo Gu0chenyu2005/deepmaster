@@ -124,9 +124,11 @@ def spawn(key, name, cmd, cwd=None, want_stdin=False, env=None):
             return {"ok": False, "error": "目录不存在：%s" % real_cwd}
         cwd = real_cwd
 
+    log = None
     master_fd = None
     slave_fd = None
     input_fd = None
+    proc = None
     try:
         log = _logfile(key)
         is_shell = isinstance(cmd, str)
@@ -159,7 +161,27 @@ def spawn(key, name, cmd, cwd=None, want_stdin=False, env=None):
             input_fd = os.dup(master_fd)
             threading.Thread(target=_read_pty, args=(master_fd, log),
                              name="pty-%s" % key, daemon=True).start()
+        elif log is not None:
+            try:
+                log.close()
+            except OSError:
+                pass
+            log = None
     except Exception as e:
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+        if log is not None:
+            try:
+                log.close()
+            except OSError:
+                pass
         for fd in (master_fd, slave_fd, input_fd):
             if fd is not None:
                 try: os.close(fd)
@@ -440,16 +462,16 @@ def _dds_run(cfg, script, timeout=30):
     host = _clean(cfg.get("dds_ip")).strip()
     user = _clean(cfg.get("dds_username")).strip()
     password = _clean(cfg.get("dds_password"))
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", host) or not user or not password:
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", host) or host.startswith("-") or not user or not password:
         return {"code": 2, "out": "请配置有效的 DDS IP、用户名和密码"}
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", user):
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", user) or user.startswith("-"):
         return {"code": 2, "out": "DDS 用户名格式无效"}
     if not shutil.which("sshpass"):
         return {"code": 2, "out": "Orin 缺少 sshpass，请安装 openssh-client 和 sshpass"}
     env = dict(os.environ, SSHPASS=password)
     remote = shlex.join(["sudo", "-S", "-p", "", "--", "bash", "-c", script])
     command = ["sshpass", "-e", "ssh", "-T", "-o", "ConnectTimeout=5",
-               "-o", "StrictHostKeyChecking=accept-new", "%s@%s" % (user, host),
+               "-o", "StrictHostKeyChecking=accept-new", "--", "%s@%s" % (user, host),
                remote]
     try:
         p = subprocess.run(command, input=password + "\n", text=True, env=env,
@@ -604,6 +626,9 @@ def run_tare(cfg):
 
     if _dry(cfg):
         return {"ok": True, "dry_run": True}
+    bin_name = _clean(cfg.get("rl_deploy_bin"), "rl_deploy")
+    if _alive(RL_KEY) or pgrep_count([bin_name]) > 0:
+        return {"ok": False, "error": "控制程序运行中，不能标零"}
     if not all(_clean(cfg.get(k)).strip() for k in ("dds_ip", "dds_username", "dds_password")):
         return {"ok": False, "error": "请先配置 DDS 主机 IP、用户名和密码"}
     k7_dir = _clean(cfg.get("k7_dir"), "/home/user")
@@ -742,10 +767,15 @@ def _pin_control_service(service_dir):
             if not tids:
                 tids = [pid]
             for tid in tids:
-                os.sched_setaffinity(tid, cpus)
-                os.setpriority(os.PRIO_PROCESS, tid, -10)
-                if os.sched_getaffinity(tid) != cpus or os.getpriority(os.PRIO_PROCESS, tid) != -10:
-                    raise OSError("调度参数校验失败（TID %d）" % tid)
+                try:
+                    os.sched_setaffinity(tid, cpus)
+                    os.setpriority(os.PRIO_PROCESS, tid, -10)
+                    if os.sched_getaffinity(tid) != cpus or os.getpriority(os.PRIO_PROCESS, tid) != -10:
+                        raise OSError("调度参数校验失败（TID %d）" % tid)
+                except ProcessLookupError:
+                    if tid == pid:
+                        raise
+                    continue
     except (OSError, ProcessLookupError) as exc:
         return {"ok": False, "error": "无法设置已运行手柄服务的 CPU 亲和性或 nice -10：%s" % exc}
     return {"ok": True}

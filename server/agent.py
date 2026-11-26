@@ -30,7 +30,7 @@ import cam        # noqa: E402
 import runner     # noqa: E402
 import system     # noqa: E402
 
-VERSION = "3.3.0"
+VERSION = "3.3.1"
 
 STATUS_PATTERNS = {
     "k7master3": ["K7Master3"],
@@ -143,36 +143,58 @@ def merge_cfg(request_cfg):
     return cfg
 
 
+_CFG_LOCK = threading.Lock()
+_PROTECTED_EXEC_KEYS = frozenset({
+    "ros_setup", "cam_viewer_script", "rl_deploy_bin", "rl_deploy_dir",
+    "k7_bin", "k7_dir", "k7_lib_path", "k7_sethome_bin", "k7_chrt",
+    "k7_taskset", "robot_service_dir", "robot_service_script",
+    "sethome_bin", "camera_user",
+})
+
+
 def save_cfg(update, allow_agent_token=False):
     """原子保存配置，移除空值及 _agent 元信息。"""
-    merged = dict(STATE["cfg"])
-    for k, v in (update or {}).items():
-        if k == "_agent":
-            continue
-        if k == "agent_token" and not allow_agent_token:
-            continue
-        if v is None or v == "":
-            merged.pop(k, None)
-        else:
-            merged[k] = v
-    root = resolve_data_root(merged.get("local_data_dir"))
-    os.makedirs(root, exist_ok=True)
-    merged["local_data_dir"] = root
-    path = STATE["cfg_path"]
-    if not path:
-        raise RuntimeError("本机没有配置文件路径（--config）")
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(merged, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
-    STATE["cfg"] = merged
-    STATE["data_root"] = root
-    print("[agent] 配置已更新（%d 项）：%s" % (len(merged), path), flush=True)
-    public = {k: v for k, v in merged.items()
-              if k not in ("agent_token", "sudo_pw", "dds_password")}
-    public["dds_password_set"] = bool(merged.get("dds_password"))
-    return {"count": len(merged), "config": public}
+    with _CFG_LOCK:
+        merged = dict(STATE["cfg"])
+        for k, v in (update or {}).items():
+            if k == "_agent":
+                continue
+            if k == "agent_token" and not allow_agent_token:
+                continue
+            if k in _PROTECTED_EXEC_KEYS:
+                continue
+            if v is None or v == "":
+                merged.pop(k, None)
+            else:
+                merged[k] = v
+        path = STATE["cfg_path"]
+        if not path:
+            raise RuntimeError("本机没有配置文件路径（--config）")
+        root = resolve_data_root(merged.get("local_data_dir"))
+        os.makedirs(root, exist_ok=True)
+        merged["local_data_dir"] = root
+        parent = os.path.dirname(os.path.abspath(path)) or "."
+        tmp = os.path.join(parent, ".%s.%d.%d.tmp" % (os.path.basename(path), os.getpid(), threading.get_ident()))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        STATE["cfg"] = merged
+        STATE["data_root"] = root
+        print("[agent] 配置已更新（%d 项）：%s" % (len(merged), path), flush=True)
+        public = {k: v for k, v in merged.items()
+                  if k not in ("agent_token", "sudo_pw", "dds_password")}
+        public["dds_password_set"] = bool(merged.get("dds_password"))
+        return {"count": len(merged), "config": public}
 
 
 def data_root():
@@ -1101,17 +1123,27 @@ def main():
         if err:
             print("[!] 预开通信口失败：%s（仍可用 /api/assign 下发）" % err, flush=True)
 
-    def _bye(signum, _frame):
-        print("[agent] 收到信号 %s，退出" % signum, flush=True)
+    stop_event = threading.Event()
 
+    def _shutdown_worker():
+        stop_event.wait()
+        print("[agent] 收到退出信号，正在清理资源", flush=True)
         try:
             runner.stop(STATE["cam_key"])
         except Exception:               # noqa: BLE001
             pass
-
-
         for srv in list(STATE["servers"].values()):
-            threading.Thread(target=srv.shutdown, daemon=True).start()
+            try:
+                srv.shutdown()
+                srv.server_close()
+            except Exception:           # noqa: BLE001
+                pass
+
+    shutdown_thread = threading.Thread(target=_shutdown_worker, name="agent-shutdown", daemon=True)
+    shutdown_thread.start()
+
+    def _bye(_signum, _frame):
+        stop_event.set()
 
     signal.signal(signal.SIGTERM, _bye)
     signal.signal(signal.SIGINT, _bye)
@@ -1119,7 +1151,11 @@ def main():
     print("[agent] 握手口就绪 http://%s:%d/api/hello   通信口: %s"
           % (args.bind, args.discovery_port,
              args.port or "等服务器下发"), flush=True)
-    disc.serve_forever()
+    try:
+        disc.serve_forever()
+    finally:
+        stop_event.set()
+        shutdown_thread.join(timeout=10)
 
 
 if __name__ == "__main__":

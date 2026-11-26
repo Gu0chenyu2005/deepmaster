@@ -64,7 +64,7 @@ Date November 2026
      
     if (e && e.target && e.target !== window && e.target.tagName) {
       dmReportError("js", "资源加载失败：" + e.target.tagName.toLowerCase(),
-        e.target.src || e.target.href || "");
+        String(e.target.src || e.target.href || "").split("?")[0]);
       return;
     }
     var msg = (e && e.message) || "脚本错误";

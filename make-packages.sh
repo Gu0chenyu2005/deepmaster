@@ -10,16 +10,61 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$DIST"
 
+OFFLINE_SUITE="${DM_UBUNTU_SUITE:-jammy}"
+OFFLINE_DEPS="$ROOT/third_party/offline/$OFFLINE_SUITE"
+if [ ! -s "$OFFLINE_DEPS/manifest.json" ]; then
+  bash "$ROOT/packaging/download-offline-deps.sh"
+fi
+for dependency_dir in amd64/apt arm64/apt amd64/python-wheels; do
+  [ -d "$OFFLINE_DEPS/$dependency_dir" ] || {
+    printf '离线依赖缺失：%s，请运行 packaging/download-offline-deps.sh\n' "$OFFLINE_DEPS/$dependency_dir" >&2
+    exit 1
+  }
+done
+python3 - "$OFFLINE_DEPS" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+manifest = json.loads((root / 'manifest.json').read_text())
+for item in manifest.get('files', []):
+    path = root / item['path']
+    if not path.is_file() or path.stat().st_size != item['size']:
+        raise SystemExit('离线依赖文件缺失或大小不符：' + item['path'])
+    if hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']:
+        raise SystemExit('离线依赖文件校验失败：' + item['path'])
+if not any((root / 'amd64' / 'python-wheels').glob('*.whl')):
+    raise SystemExit('服务端离线 wheel 缺失，请重新准备依赖包')
+for directory in ('amd64/apt', 'arm64/apt'):
+    if not list((root / directory).glob('*.deb')):
+        raise SystemExit('离线 deb 包缺失：' + directory)
+PY
 need() { [ -e "$1" ] || { echo "缺少 $1" >&2; exit 1; }; }
 
 check_package() {
-  python3 - "$1" <<'PY'
+  python3 - "$1" "$OFFLINE_SUITE" <<'PY'
 from pathlib import Path
 import sys
 
 root = Path(sys.argv[1])
+suite = root / 'third_party' / 'offline' / sys.argv[2]
 assert sorted(p.name for p in root.glob('*.sh')) == ['install.sh']
 assert sorted(p.name for p in root.rglob('*.md')) == ['README.md']
+if root.name == 'dm-web':
+    expected = (suite / 'amd64' / 'apt', suite / 'amd64' / 'python-wheels')
+    forbidden = suite / 'arm64'
+else:
+    expected = (suite / 'arm64' / 'apt',)
+    forbidden = suite / 'amd64'
+for directory in expected:
+    assert directory.is_dir(), directory
+assert list(expected[0].glob('*.deb')), expected[0]
+assert (expected[0] / 'Packages.gz').is_file(), expected[0]
+if root.name == 'dm-web':
+    assert list(expected[1].glob('*.whl')), expected[1]
+assert not forbidden.exists(), forbidden
 for p in root.rglob('*'):
     assert p.name not in {'__pycache__', '.git', 'logs', 'backups', 'tests', '.secret'}, p
     assert not p.name.endswith(('.log', '.pyc', '.bak', '.db', '.db-wal', '.db-shm')), p
@@ -47,7 +92,7 @@ for token in (b'ARMDOG_CAMERA_PORTS_FILE', b'ARMDOG_SHARED_FRAME_CAMERAS',
               b'ARMDOG_DATA_ROOT', b'ARMDOG_CAMERA_DISABLE',
               b'ARMDOG_CONTROL_ONLY'):
     if token not in binary:
-        raise SystemExit('请先同步最新采集程序二进制')
+        raise SystemExit('采集端 rl_deploy 二进制缺少仅控制模式标记 %s；请用更新后的源码重新编译后再打包' % token.decode())
 PY
   mkdir -p "$P/prog/rl_deploy/build" "$P/prog/rl_deploy/scripts" "$P/prog/service" "$P/runtime" "$P/agent" "$P/cam"
   cp -a "$DEPLOY/build/rl_deploy" "$P/prog/rl_deploy/build/"
@@ -71,6 +116,10 @@ PY
   cp -a "$ROOT/packaging/host_config.orin.json" "$P/host_config.json"
   cp -a "$ROOT/packaging/install-orin.sh" "$P/install.sh"
   cp -a "$ROOT/packaging/README-orin.md" "$P/README.md"
+  mkdir -p "$P/third_party"
+  cp -a "$ROOT/third_party/dependencies.json" "$P/third_party/"
+  mkdir -p "$P/third_party/offline/$OFFLINE_SUITE"
+  cp -a "$OFFLINE_DEPS/arm64" "$P/third_party/offline/$OFFLINE_SUITE/"
   python3 - "$P" <<'PY'
 from pathlib import Path
 import shutil
@@ -85,8 +134,8 @@ for p in sorted(root.rglob('*'), reverse=True):
 PY
   chmod +x "$P/install.sh"
   check_package "$P"
-  local OUT="$DIST/orin-collect-v$VERSION-$TS.tar.zst"
-  tar -I 'zstd -3 -T0' -cf "$OUT" -C "$STAGE" dm-collect
+  local OUT="$DIST/orin-collect-v$VERSION-$TS.tar.gz"
+  tar -czf "$OUT" -C "$STAGE" dm-collect
   echo "$OUT"
 }
 
@@ -101,6 +150,10 @@ build_server() {
   cp -a "$ROOT/packaging/host_config.server.json" "$P/host_config.json"
   cp -a "$ROOT/packaging/install-server.sh" "$P/install.sh"
   cp -a "$ROOT/packaging/README-server.md" "$P/README.md"
+  mkdir -p "$P/third_party"
+  cp -a "$ROOT/third_party/dependencies.json" "$P/third_party/"
+  mkdir -p "$P/third_party/offline/$OFFLINE_SUITE"
+  cp -a "$OFFLINE_DEPS/amd64" "$P/third_party/offline/$OFFLINE_SUITE/"
   find "$P" -type d -exec chmod 755 {} +
   find "$P" -type f -exec chmod 644 {} +
   chmod +x "$P/install.sh"

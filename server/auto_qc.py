@@ -1770,6 +1770,32 @@ def _transfer_files(src_folder, dest_folder, file_names, copy_mode):
             shutil.move(src_file, dst_file)
 
 
+def _remove_empty_input_folder(src, input_dir, output_dirs=()):
+    """Remove only an empty child folder, never the selected root or linked data."""
+    source = os.path.abspath(src)
+    if os.path.islink(source) or not os.path.isdir(source):
+        return False
+    source_real = os.path.realpath(source)
+    input_real = os.path.realpath(input_dir)
+    try:
+        if source_real == input_real or os.path.commonpath((source_real, input_real)) != input_real:
+            return False
+    except ValueError:
+        return False
+    for output_dir in output_dirs:
+        output_real = os.path.realpath(output_dir)
+        try:
+            if os.path.commonpath((source_real, output_real)) in (source_real, output_real):
+                return False
+        except ValueError:
+            continue
+    try:
+        os.rmdir(source)
+        return True
+    except OSError:
+        return False
+
+
 def _resolve_workers(workers, rules):
     """解析并行进程数（0 表示自动匹配 CPU 核心数）。"""
     if workers is None:
@@ -2049,15 +2075,8 @@ def run_qc(input_dir, pass_dir=None, review_dir=None, copy_mode=False, dry_run=F
                         if name not in unreadable_files:
                             write_file_fail_reason(os.path.join(review_dest, name), reasons)
 
-                abs_src = os.path.abspath(src)
-                abs_out = os.path.abspath(output_dir)
-                if (
-                    not copy_mode
-                    and os.path.isdir(abs_src)
-                    and abs_out != abs_src
-                    and not abs_out.startswith(abs_src + os.sep)
-                ):
-                    shutil.rmtree(abs_src, ignore_errors=True)
+                if not copy_mode:
+                    _remove_empty_input_folder(src, input_dir, (output_dir,))
 
             report_dir = review_dest
         else:
@@ -2073,8 +2092,8 @@ def run_qc(input_dir, pass_dir=None, review_dir=None, copy_mode=False, dry_run=F
                         if name not in unreadable_files:
                             write_file_fail_reason(os.path.join(review_dest, name), reasons)
 
-                if not copy_mode and os.path.isdir(src):
-                    shutil.rmtree(src, ignore_errors=True)
+                if not copy_mode:
+                    _remove_empty_input_folder(src, input_dir, (pass_dir, review_dir, json_dir))
 
             report_dir = json_dir
 

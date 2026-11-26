@@ -221,6 +221,11 @@ class SegmentReader:
                     self.error = ""
                 except Exception as exc:
                     self.error = f"open failed: {exc}"
+                    if fd >= 0:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
                     mm, fd, ino = None, -1, None
                     time.sleep(0.5)
                     continue
@@ -249,10 +254,15 @@ class SegmentReader:
                 self._last_seq = f["seq"]
                 last_new = now
                 frames += 1
-                bgr = self._to_bgr(f)
-                jpg = encode_jpeg(draw_overlay(
-                    bgr, f"{self.name}  {f['label']}  {f['width']}x{f['height']}",
-                    f"seq={f['seq']}  {f['fps']}fps  rl_deploy shared-mem"))
+                try:
+                    bgr = self._to_bgr(f)
+                    jpg = encode_jpeg(draw_overlay(
+                        bgr, f"{self.name}  {f['label']}  {f['width']}x{f['height']}",
+                        f"seq={f['seq']}  {f['fps']}fps  rl_deploy shared-mem"))
+                except Exception as exc:
+                    self.error = f"decode failed: {exc}"
+                    time.sleep(0.05)
+                    continue
                 with self.lock:
                     self.frame_bgr = bgr
                     self.label = f["label"]
@@ -518,11 +528,12 @@ class DirectCameraReader:
                     if auto_limit is not None and sensor.supports(auto_limit):
                         try:
                             option_range = sensor.get_option_range(auto_limit)
-                            frame_budget_ms = 1000.0 / max(1, video.fps())
+                            frame_budget_us = 1000000.0 / max(1, video.fps())
                             limit = min(option_range.max, max(option_range.min,
-                                         frame_budget_ms))
+                                         frame_budget_us))
                             sensor.set_option(auto_limit, limit)
-                            self.exposure_diagnostics["auto_exposure_limit_ms"] = limit
+                            self.exposure_diagnostics["auto_exposure_limit_us"] = limit
+                            self.exposure_diagnostics["auto_exposure_limit_ms"] = round(limit / 1000.0, 3)
                         except Exception as exc:
                             self.exposure_diagnostics["auto_exposure_limit_error"] = str(exc)
                 first_frameset = pipeline.wait_for_frames(DIRECT_FRAME_TIMEOUT_MS)

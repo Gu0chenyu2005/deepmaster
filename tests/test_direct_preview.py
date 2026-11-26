@@ -70,6 +70,82 @@ def profile_device(*profiles):
 
 
 class DirectPreviewTests(unittest.TestCase):
+    def test_shared_memory_reader_closes_fd_when_mmap_fails(self):
+        reader = camera_shm_viewer.SegmentReader('primary')
+        reader._stop.clear()
+
+        def stop_after_retry(_seconds):
+            reader._stop.set()
+
+        with patch.object(camera_shm_viewer.os, 'stat', return_value=types.SimpleNamespace(st_ino=7)), \
+             patch.object(camera_shm_viewer.os, 'open', return_value=55), \
+             patch.object(camera_shm_viewer.os, 'close') as close_fd, \
+             patch.object(camera_shm_viewer.mmap, 'mmap', side_effect=OSError('mapping failed')), \
+             patch.object(camera_shm_viewer.time, 'sleep', side_effect=stop_after_retry):
+            reader._run()
+        close_fd.assert_called_once_with(55)
+
+    def test_auto_exposure_limit_uses_microseconds(self):
+        profile = FakeVideoProfile(640, 480, 30, 'rgb8')
+        applied = []
+
+        class Sensor:
+            def get_stream_profiles(self):
+                return [profile]
+
+            def supports(self, option):
+                return True
+
+            def set_option(self, option, value):
+                applied.append((option, value))
+
+            def get_option(self, option):
+                return 0
+
+            def get_option_range(self, _option):
+                return types.SimpleNamespace(min=1, max=100000)
+
+        class Device(FakeDevice):
+            def query_sensors(self):
+                return [Sensor()]
+
+        device = Device('serial', 'usb')
+        sensor = Sensor()
+        device.query_sensors = lambda: [sensor]
+        active = types.SimpleNamespace(get_device=lambda: device)
+
+        class Pipeline:
+            def start(self, _config):
+                return active
+
+            def wait_for_frames(self, _timeout):
+                return types.SimpleNamespace(get_color_frame=lambda: object())
+
+            def stop(self):
+                pass
+
+        class Config:
+            def enable_device(self, _serial):
+                pass
+
+            def enable_stream(self, *_args):
+                pass
+
+        rs = types.SimpleNamespace(
+            context=lambda: types.SimpleNamespace(query_devices=lambda: [device]),
+            camera_info=types.SimpleNamespace(serial_number='serial'),
+            option=types.SimpleNamespace(frames_queue_size='queue', global_time_enabled='global',
+                                        auto_exposure_priority='priority', exposure='exposure',
+                                        auto_exposure_limit='limit'),
+            pipeline=Pipeline, config=Config,
+            stream=types.SimpleNamespace(color='color'),
+            format=types.SimpleNamespace(mjpeg='mjpeg', bgr8='bgr8', rgb8='rgb8', yuyv='yuyv'))
+        reader = camera_shm_viewer.DirectCameraReader('primary', 'serial', rs)
+        pipeline, _frames = reader._open()
+        self.assertIsInstance(pipeline, Pipeline)
+        self.assertIn(('limit', 1000000.0 / 30), applied)
+        self.assertAlmostEqual(reader.exposure_diagnostics['auto_exposure_limit_ms'], 33.333, places=2)
+
     def test_direct_reader_recovers_from_a_transient_frame_timeout(self):
         reader = camera_shm_viewer.DirectCameraReader("primary", "serial", fake_rs())
 

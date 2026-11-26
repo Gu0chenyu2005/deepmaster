@@ -9,24 +9,30 @@ API_PORT="${API_PORT:-8765}"
 for file in server/api.py server/run_web.py index.html host_config.json; do
   [ -f "$ROOT/$file" ] || { echo "缺少 $ROOT/$file" >&2; exit 1; }
 done
-if ! python3 -c 'import h5py, numpy, requests' 2>/dev/null; then
-  apt-get update
-  apt-get install -y python3 python3-h5py python3-numpy python3-requests
-fi
-if ! command -v ffmpeg >/dev/null || ! python3 -c 'import PIL' 2>/dev/null; then
-  apt-get update
-  apt-get install -y ffmpeg python3-pil
-fi
-if ! /usr/bin/python3 -c 'import pyarrow, pandas' 2>/dev/null; then
-  apt-get update
-  apt-get install -y python3-venv
-  /usr/bin/python3 -m venv "$ROOT/.export-venv"
-  "$ROOT/.export-venv/bin/python" -m pip install 'numpy>=1.23,<2' 'h5py>=3.8,<4' pillow 'pyarrow>=17,<26' 'pandas>=2,<3'
-fi
-EXPORT_PYTHON=/usr/bin/python3
-if [ -x "$ROOT/.export-venv/bin/python" ]; then
-  EXPORT_PYTHON="$ROOT/.export-venv/bin/python"
-fi
+SUITE="${DM_UBUNTU_SUITE:-$(. /etc/os-release; printf '%s' "$VERSION_CODENAME")}"
+[ "$SUITE" = jammy ] || { printf '离线依赖包针对 Ubuntu 22.04 (jammy)，当前系统为 %s。\n' "$SUITE" >&2; exit 1; }
+OFFLINE="$ROOT/third_party/offline/$SUITE/amd64"
+for dir in "$OFFLINE/apt" "$OFFLINE/python-wheels"; do
+  [ -d "$dir" ] || { printf '缺少离线依赖目录：%s\n' "$dir" >&2; exit 1; }
+done
+for file in Packages Packages.gz; do
+  [ -s "$OFFLINE/apt/$file" ] || { printf '离线 APT 索引缺失：%s\n' "$OFFLINE/apt/$file" >&2; exit 1; }
+done
+APT_SOURCE="$(mktemp)"
+trap 'python3 -c '\''import os,sys; os.unlink(sys.argv[1]) if os.path.exists(sys.argv[1]) else None'\'' "$APT_SOURCE"' EXIT
+printf 'deb [trusted=yes] file:%s/apt ./\n' "$OFFLINE" > "$APT_SOURCE"
+APT_OFFLINE=(-o "Dir::Etc::sourcelist=$APT_SOURCE" -o 'Dir::Etc::sourceparts=-')
+apt-get "${APT_OFFLINE[@]}" update
+apt-get "${APT_OFFLINE[@]}" install --yes \
+  python3-venv ca-certificates ffmpeg python3-h5py python3-numpy python3-requests python3-pil
+/usr/bin/python3 -m venv "$ROOT/.export-venv"
+"$ROOT/.export-venv/bin/python" -m pip install --no-index --find-links "$OFFLINE/python-wheels" \
+  'numpy==1.26.4' 'h5py==3.16.0' 'pillow==12.3.0' \
+  'pyarrow==25.0.1' 'pandas==2.3.3' \
+  'python-dateutil==3.0.0' 'pytz==2026.6' 'six==1.17.0' 'tzdata==2026.6'
+python3 -c 'import h5py, numpy, requests, PIL'
+command -v ffmpeg >/dev/null || { printf '离线安装后仍缺少 ffmpeg。\n' >&2; exit 1; }
+EXPORT_PYTHON="$ROOT/.export-venv/bin/python"
 python3 - "$PORT" "$API_PORT" <<'PY'
 import sys
 ports = [int(value) for value in sys.argv[1:]]

@@ -12,17 +12,15 @@ Date November 2026
     return;
   }
 
-  function post(path, body) {
-    return fetch("/api" + path, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + (function () {
-          try { return sessionStorage.getItem("dm.token") || ""; } catch (e) { return ""; }
-        })()
-      },
-      body: JSON.stringify(body || {})
-    }).then(function (r) {
+  function request(url, options, timeoutMs, message) {
+    var controller = (typeof AbortController === "function" && timeoutMs > 0)
+      ? new AbortController() : null;
+    var timer = controller ? setTimeout(function () { controller.abort(); }, timeoutMs) : null;
+    var clearTimer = function () {
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+    };
+    return fetch(url, Object.assign({}, options || {},
+      controller ? { signal: controller.signal } : {})).then(function (r) {
       return r.json().then(function (j) {
         if (!r.ok || j.ok === false) {
           var err = new Error(j.message || ("HTTP " + r.status));
@@ -31,22 +29,42 @@ Date November 2026
         }
         return j.data !== undefined ? j.data : j;
       });
+    }).then(function (data) {
+      clearTimer();
+      return data;
+    }, function (error) {
+      clearTimer();
+      if (controller && error && error.name === "AbortError") {
+        var timeout = new Error(message || "请求超时，请检查采集端连接");
+        timeout.code = 408;
+        throw timeout;
+      }
+      throw error;
     });
   }
 
-  function get(path) {
-    return fetch("/api" + path, {
+  function post(path, body, timeoutMs) {
+    return request("/api" + path, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + (function () {
+          try { return sessionStorage.getItem("dm.token") || ""; } catch (e) { return ""; }
+        })()
+      },
+      body: JSON.stringify(body || {})
+    }, timeoutMs === undefined ? 25000 : timeoutMs, "请求超时，请检查采集端连接");
+  }
+
+  function get(path, timeoutMs) {
+    return request("/api" + path, {
       headers: {
         "Authorization": "Bearer " + (function () {
           try { return sessionStorage.getItem("dm.token") || ""; } catch (e) { return ""; }
         })()
       },
       cache: "no-store"
-    }).then(function (r) { return r.json(); })
-      .then(function (j) {
-        if (j.ok === false) { throw new Error(j.message || "请求失败"); }
-        return j.data !== undefined ? j.data : j;
-      });
+    }, timeoutMs === undefined ? 10000 : timeoutMs, "请求超时，请检查服务连接");
   }
 
   function cameraBase(cfg) {
@@ -61,7 +79,7 @@ Date November 2026
     var note = function (t) { try { onLine && onLine(t); } catch (e) {} };
     note("→ 本机执行 " + action);
     var body = Object.assign({ cfg: cfg || {} }, extra || {});
-    return post("/run/" + action, body)
+    return post("/run/" + action, body, 150000)
       .then(function (d) {
         if (d && d.ok === false) {
           note("✗ " + (d.error || "失败"));
@@ -125,9 +143,8 @@ Date November 2026
 
     camHealth: function (cfg) {
       var base = cameraBase(cfg);
-      return fetch(base + "/health?" + cameraQuery(""), { cache: "no-store" })
-        .then(function (r) { if (!r.ok) { throw new Error("HTTP " + r.status); } return r.json(); })
-        .then(function (j) { return j.data !== undefined ? j.data : j; })
+      return request(base + "/health?" + cameraQuery(""), { cache: "no-store" },
+                     5000, "相机状态请求超时")
         .catch(function () { return null; });
     },
 

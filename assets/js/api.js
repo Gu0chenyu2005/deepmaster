@@ -43,12 +43,20 @@ Date November 2026
     if (t) { headers["Authorization"] = "Bearer " + t; }
 
     var url = BASE + "/api" + path + qs(opts.query);
+    var timeoutMs = typeof opts.timeout === "number" ? opts.timeout : 20000;
+    var controller = (typeof AbortController === "function" && !opts.signal && timeoutMs > 0)
+      ? new AbortController() : null;
+    var timer = controller ? setTimeout(function () { controller.abort(); }, timeoutMs) : null;
+    var clearTimer = function () {
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+    };
 
     return fetch(url, {
       method: method,
       headers: headers,
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-      cache: "no-store"
+      cache: "no-store",
+      signal: opts.signal || (controller ? controller.signal : undefined)
     }).then(function (r) {
       var ctype = r.headers.get("Content-Type") || "";
       if (ctype.indexOf("application/json") < 0) {
@@ -68,6 +76,15 @@ Date November 2026
         }
         return j.data !== undefined ? j.data : j;
       });
+    }).then(function (value) {
+      clearTimer();
+      return value;
+    }, function (error) {
+      clearTimer();
+      if (controller && error && error.name === "AbortError") {
+        throw new ApiError(408, "请求超时，请检查网络连接");
+      }
+      throw error;
     });
   }
 
@@ -123,7 +140,9 @@ Date November 2026
     runningSession: function () { return request("GET", "/sessions/running"); },
      
     runAction: function (action, cfg) {
-      return request("POST", "/run/" + action, { body: { cfg: cfg || {} } });
+      return request("POST", "/run/" + action, {
+        body: { cfg: cfg || {} }, timeout: 150000
+      });
     },
     runStatus: function () { return request("GET", "/run/status"); },
 
@@ -179,11 +198,11 @@ Date November 2026
     system: function () { return request("GET", "/system"); },
     latency: function () { return request("GET", "/latency"); },
 
-    scanAgents: function () { return request("POST", "/agent/scan", { body: {} }); },
+    scanAgents: function () { return request("POST", "/agent/scan", { body: {}, timeout: 60000 }); },
      
     connectAgent: function (ip, discoveryPort) {
       return request("POST", "/agent/connect", {
-        body: { ip: ip, discovery_port: discoveryPort || 5111 }
+        body: { ip: ip, discovery_port: discoveryPort || 5111 }, timeout: 60000
       });
     },
      

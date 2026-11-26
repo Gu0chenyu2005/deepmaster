@@ -125,6 +125,8 @@ class WebRTCPreview:
         self.monitor_thread = None
         self.monitor_started = False
         self._last_connection_log = None
+        self._last_monitor_error = None
+        self._last_publish_errors = {}
         self.frame_conditions = {name: threading.Condition() for name in self.readers}
         self.frame_slots = {name: None for name in self.readers}
         self.slot_overwrites = {name: 0 for name in self.readers}
@@ -141,7 +143,13 @@ class WebRTCPreview:
             with condition:
                 condition.wait_for(lambda: self.frame_slots[name] is not None)
                 item, self.frame_slots[name] = self.frame_slots[name], None
-            self._push_frame(name, *item)
+            try:
+                self._push_frame(name, *item)
+            except Exception as exc:
+                message = str(exc)
+                if message != self._last_publish_errors.get(name):
+                    print("[webrtc] %s 帧发布失败：%s" % (name, message), flush=True)
+                    self._last_publish_errors[name] = message
 
     def _stage_frame_rate(self, values, name, now):
         sample = values.setdefault(name, {"count": 0, "at": now, "fps": 0.0})
@@ -207,42 +215,66 @@ class WebRTCPreview:
     def _monitor(self):
         while True:
             time.sleep(2)
-            with self.lock:
-                state = self.session
-                if not state or not state.get("pc"):
-                    continue
-                connection = state["pc"].get_property("connection-state")
-                name = getattr(connection, "value_nick", str(connection)).lower()
-                ice = state["pc"].get_property("ice-connection-state")
-                ice_name = getattr(ice, "value_nick", str(ice)).lower()
-                pair = (name, ice_name)
-                if pair != self._last_connection_log:
-                    print("[webrtc] connection=%s ice=%s" % pair, flush=True)
-                    self._last_connection_log = pair
+            close_id = None
+            try:
+                with self.lock:
+                    state = self.session
+                    if not state or not state.get("pc"):
+                        continue
+                    connection = state["pc"].get_property("connection-state")
+                    name = getattr(connection, "value_nick", str(connection)).lower()
+                    ice = state["pc"].get_property("ice-connection-state")
+                    ice_name = getattr(ice, "value_nick", str(ice)).lower()
+                    pair = (name, ice_name)
+                    if pair != self._last_connection_log:
+                        print("[webrtc] connection=%s ice=%s" % pair, flush=True)
+                        self._last_connection_log = pair
+                    now = time.monotonic()
+                    if now - state.get("last_stats_log", 0) >= 5:
+                        state["last_stats_log"] = now
+                        counts = state.get("frame_counts", {})
+                        packets = state.get("rtp_counts", {})
+                        print("[webrtc] video frames=%s rtp_packets=%s" %
+                              (counts, packets), flush=True)
+                    bus = state["pipeline"].get_bus()
+                    message_types = self.gst.MessageType.ERROR | self.gst.MessageType.EOS
+                    message = bus.pop_filtered(message_types) if bus is not None else None
+                    failed = False
+                    while message:
+                        if message.type == self.gst.MessageType.ERROR:
+                            error, debug = message.parse_error()
+                            print("[webrtc] pipeline error: %s (%s)" % (error, debug), flush=True)
+                        else:
+                            print("[webrtc] pipeline reached EOS", flush=True)
+                        failed = True
+                        message = bus.pop_filtered(message_types)
+                    if failed:
+                        close_id = state["id"]
+                    elif name == "connected":
+                        state["touched"] = now
+                        state["ever_connected"] = True
+                        if not state.get("keyframe_requested"):
+                            self._request_keyframes(state)
+                            state["keyframe_requested"] = True
+                    elif name in ("failed", "disconnected", "closed"):
+                        state.setdefault("disconnected_at", now)
+                        if now - state["disconnected_at"] >= 6:
+                            close_id = state["id"]
+                    else:
+                        state.pop("disconnected_at", None)
+                        if (not state.get("ever_connected")
+                                and now - state.get("created_at", now) >= 20):
+                            close_id = state["id"]
+                if close_id:
+                    self.close(close_id)
+            except Exception as exc:
+                message = str(exc)
                 now = time.monotonic()
-                if now - state.get("last_stats_log", 0) >= 5:
-                    state["last_stats_log"] = now
-                    counts = state.get("frame_counts", {})
-                    packets = state.get("rtp_counts", {})
-                    print("[webrtc] video frames=%s rtp_packets=%s" %
-                          (counts, packets), flush=True)
-                bus = state["pipeline"].get_bus()
-                message = bus.pop_filtered(self.gst.MessageType.ERROR)
-                while message:
-                    error, debug = message.parse_error()
-                    print("[webrtc] pipeline error: %s (%s)" % (error, debug), flush=True)
-                    message = bus.pop_filtered(self.gst.MessageType.ERROR)
-                if name == "connected":
-                    state["touched"] = time.monotonic()
-                    if not state.get("keyframe_requested"):
-                        self._request_keyframes(state)
-                        state["keyframe_requested"] = True
-                elif name in ("failed", "disconnected", "closed"):
-                    state.setdefault("disconnected_at", time.monotonic())
-                    if time.monotonic() - state["disconnected_at"] >= 6:
-                        self._close_locked(state["id"])
-                else:
-                    state.pop("disconnected_at", None)
+                if (message != self._last_monitor_error
+                        or now - getattr(self, "_last_monitor_error_at", 0) >= 10):
+                    print("[webrtc] 状态检查失败：%s" % message, flush=True)
+                    self._last_monitor_error = message
+                    self._last_monitor_error_at = now
 
     @staticmethod
     def _request_keyframes(state):
@@ -269,7 +301,7 @@ class WebRTCPreview:
             # A caps change while PLAYING can leave nvvidconv/encoder in an
             # invalid state. Resolution changes are therefore opt-in and must
             # be coordinated by a full pipeline restart.
-            if state.get("allow_hot_resize", True):
+            if state.get("allow_hot_resize", False):
                 for scaler, source_size in state.get("scalers", {}).values():
                     width, height = quality_dimensions(*source_size, scale)
                     caps = self.gst.Caps.from_string(
@@ -341,10 +373,11 @@ class WebRTCPreview:
                     self.slot_overwrites[name] = 0
             self._load()
             remote, codecs = self._parse_offer(offer)
-            self.session = {"id": session_id, "touched": time.monotonic(),
+            now = time.monotonic()
+            self.session = {"id": session_id, "touched": now, "created_at": now,
                             "pipeline": self.gst.Pipeline.new("dm-webrtc-preview"),
                             "sources": {}, "encoders": {}, "scalers": {},
-                            "rtp_pads": {}, "pc": None,
+                            "rtp_pads": {}, "pc": None, "probes": [],
                             "frame_counts": {}, "rtp_counts": {}, "last_stats_log": 0,
                             "publish_rate": {}, "encode_rate": {},
                             # Start at the minimum bitrate; the browser raises quality after stability checks.
@@ -455,14 +488,16 @@ class WebRTCPreview:
                 _state["rtp_counts"][_name] = _state["rtp_counts"].get(_name, 0) + 1
                 return gst.PadProbeReturn.OK
 
-            src_pad.add_probe(gst.PadProbeType.BUFFER, count_rtp)
+            rtp_probe = src_pad.add_probe(gst.PadProbeType.BUFFER, count_rtp)
+            state["probes"].append((src_pad, rtp_probe))
             encoded_pad = parser.get_static_pad("src")
 
             def count_encoded(_pad, _info, _state=state, _name=name):
                 self._stage_frame_rate(_state["encode_rate"], _name, time.monotonic())
                 return gst.PadProbeReturn.OK
 
-            encoded_pad.add_probe(gst.PadProbeType.BUFFER, count_encoded)
+            encode_probe = encoded_pad.add_probe(gst.PadProbeType.BUFFER, count_encoded)
+            state["probes"].append((encoded_pad, encode_probe))
             sink = pc.request_pad_simple("sink_%u")
             if sink is None or src_pad.link(sink) != gst.PadLinkReturn.OK:
                 raise RuntimeError("无法添加 %s 视频轨道" % name)
@@ -519,7 +554,7 @@ class WebRTCPreview:
 
     def _push_frame(self, name, data, width, height, pixel_format, captured_at):
         state = self.session
-        if not state or name not in state["sources"]:
+        if not state or state.get("closing") or name not in state["sources"]:
             return
         src, fmt, expected_width, expected_height = state["sources"][name]
         if (width, height) != (expected_width, expected_height):
@@ -534,23 +569,26 @@ class WebRTCPreview:
                 data = frame.tobytes()
             except Exception:
                 return
-        buffer = self.gst.Buffer.new_allocate(None, len(data), None)
-        buffer.fill(0, data)
-        base_time = state["pipeline"].get_base_time()
-        pts = int(captured_at * self.gst.SECOND) - int(base_time)
-        buffer.pts = max(0, pts)
-        buffer.dts = self.gst.CLOCK_TIME_NONE
-        fps = max(1, min(int(self.readers[name].source_fps or 30), 60))
-        buffer.duration = self.gst.SECOND // fps
-        try:
-            result = src.emit("push-buffer", buffer)
-            if result == self.gst.FlowReturn.OK:
-                state["frame_counts"][name] = state["frame_counts"].get(name, 0) + 1
-                self._stage_frame_rate(state["publish_rate"], name, time.monotonic())
-            elif result not in (None, self.gst.FlowReturn.FLUSHING):
-                print("[webrtc] %s appsrc=%s" % (name, result), flush=True)
-        except Exception:
-            pass
+        with self.lock:
+            if self.session is not state or state.get("closing"):
+                return
+            buffer = self.gst.Buffer.new_allocate(None, len(data), None)
+            buffer.fill(0, data)
+            base_time = state["pipeline"].get_base_time()
+            pts = int(captured_at * self.gst.SECOND) - int(base_time)
+            buffer.pts = max(0, pts)
+            buffer.dts = self.gst.CLOCK_TIME_NONE
+            fps = max(1, min(int(self.readers[name].source_fps or 30), 60))
+            buffer.duration = self.gst.SECOND // fps
+            try:
+                result = src.emit("push-buffer", buffer)
+                if result == self.gst.FlowReturn.OK:
+                    state["frame_counts"][name] = state["frame_counts"].get(name, 0) + 1
+                    self._stage_frame_rate(state["publish_rate"], name, time.monotonic())
+                elif result not in (None, self.gst.FlowReturn.FLUSHING):
+                    print("[webrtc] %s appsrc=%s" % (name, result), flush=True)
+            except Exception:
+                pass
 
     def close(self, session_id):
         if not session_id:
@@ -562,8 +600,14 @@ class WebRTCPreview:
         state = self.session
         if not state or state["id"] != session_id:
             return {"closed": False}
+        state["closing"] = True
         self.session = None
         try:
+            for pad, probe_id in state.get("probes", ()):
+                try:
+                    pad.remove_probe(probe_id)
+                except Exception:
+                    pass
             pc = state.get("pc")
             if pc is not None:
                 for sink in state.get("sinks", []):
@@ -581,7 +625,6 @@ class WebRTCPreview:
             with condition:
                 self.frame_slots[name] = None
                 condition.notify_all()
-        state.clear()
         return {"closed": True}
 
 

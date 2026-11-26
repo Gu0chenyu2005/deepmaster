@@ -1,6 +1,6 @@
 # 服务端
 
-Ubuntu，解压后部署：
+Ubuntu 22.04 amd64，解压后离线部署。依赖已包含在部署包中，清单见 `third_party/dependencies.json`：
 
 ```bash
 mkdir -p ~/username

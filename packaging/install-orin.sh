@@ -11,20 +11,31 @@ for file in agent/agent.py agent/runner.py agent/cam.py agent/system.py host_con
   cam/camera_shm_viewer.py cam/webrtc_preview.py; do
   [ -f "$ROOT/$file" ] || { echo "缺少 $ROOT/$file" >&2; exit 1; }
 done
-if ! python3 -c 'import h5py, numpy, cv2' 2>/dev/null || ! command -v ssh >/dev/null || ! command -v sshpass >/dev/null || ! command -v lsof >/dev/null; then
-  apt-get update
-  apt-get install -y python3 python3-h5py python3-numpy python3-opencv openssh-client sshpass lsof
-fi
-if ! dpkg-query -W -f='${Status}' gstreamer1.0-plugins-bad 2>/dev/null | grep -q 'install ok installed' || \
+SUITE="${DM_UBUNTU_SUITE:-$(. /etc/os-release; printf '%s' "$VERSION_CODENAME")}"
+[ "$SUITE" = jammy ] || { printf '离线依赖包针对 Ubuntu 22.04 (jammy)，当前系统为 %s。\n' "$SUITE" >&2; exit 1; }
+OFFLINE="$ROOT/third_party/offline/$SUITE/arm64/apt"
+[ -d "$OFFLINE" ] || { printf '缺少采集端离线依赖目录：%s\n' "$OFFLINE" >&2; exit 1; }
+for file in Packages Packages.gz; do
+  [ -s "$OFFLINE/$file" ] || { printf '离线 APT 索引缺失：%s\n' "$OFFLINE/$file" >&2; exit 1; }
+done
+APT_SOURCE="$(mktemp)"
+trap 'python3 -c '\''import os,sys; os.unlink(sys.argv[1]) if os.path.exists(sys.argv[1]) else None'\'' "$APT_SOURCE"' EXIT
+printf 'deb [trusted=yes] file:%s ./\n' "$OFFLINE" > "$APT_SOURCE"
+APT_OFFLINE=(-o "Dir::Etc::sourcelist=$APT_SOURCE" -o 'Dir::Etc::sourceparts=-')
+apt-get "${APT_OFFLINE[@]}" update
+apt-get "${APT_OFFLINE[@]}" install --yes \
+  python3 python3-h5py python3-numpy python3-opencv openssh-client sshpass lsof \
+  gstreamer1.0-tools gir1.2-gst-plugins-bad-1.0 gstreamer1.0-plugins-bad \
+  gstreamer1.0-nice gstreamer1.0-plugins-good python3-gi python3-gst-1.0
+if ! command -v gst-inspect-1.0 >/dev/null || \
+   ! dpkg-query -W -f='${Status}' gstreamer1.0-plugins-bad 2>/dev/null | grep -q 'install ok installed' || \
    ! gst-inspect-1.0 webrtcbin >/dev/null 2>&1 || \
    ! gst-inspect-1.0 nicesrc >/dev/null 2>&1 || \
    ! gst-inspect-1.0 nicesink >/dev/null 2>&1 || \
    ! gst-inspect-1.0 nvv4l2h264enc >/dev/null 2>&1 || \
    ! gst-inspect-1.0 h264parse >/dev/null 2>&1; then
-  apt-get update
-  apt-get install -y gir1.2-gst-plugins-bad-1.0 \
-    gstreamer1.0-plugins-bad gstreamer1.0-nice gstreamer1.0-plugins-good \
-    python3-gi python3-gst-1.0
+  printf '采集端离线安装后仍缺少 GStreamer 插件或 NVIDIA JetPack 编码器，请核对 JetPack 版本和本地依赖包。\n' >&2
+  exit 1
 fi
 for plugin in webrtcbin nicesrc nicesink nvv4l2h264enc h264parse rtph264pay; do
   gst-inspect-1.0 "$plugin" >/dev/null 2>&1 || {
@@ -32,6 +43,14 @@ for plugin in webrtcbin nicesrc nicesink nvv4l2h264enc h264parse rtph264pay; do
     exit 1
   }
 done
+if [ ! -f /opt/ros/humble/setup.bash ]; then
+  printf '缺少 ROS 2 Humble：请先安装并配置 ROS 2 Humble，再重新运行安装脚本。\n' >&2
+  exit 1
+fi
+if ! command -v rs-enumerate-devices >/dev/null 2>&1; then
+  printf '缺少 librealsense 工具：请先安装与 Orin/JetPack 匹配的 RealSense 驱动，再重新运行安装脚本。\n' >&2
+  exit 1
+fi
 camera_python_ready=0
 if /usr/bin/python3 -c 'import pyrealsense2 as rs; rs.context()' 2>/dev/null; then
   camera_python_ready=1
@@ -46,7 +65,7 @@ else
   done
 fi
 if [ "$camera_python_ready" -eq 0 ]; then
-  printf '远控仅控制需要 pyrealsense2：请安装与系统 RealSense 驱动匹配的 Python 绑定。当前继续部署，近控和常规采集可正常使用。\n' >&2
+  printf '警告：未找到与系统驱动匹配的 pyrealsense2 Python 绑定；远控仅控制不可用，近控与常规采集仍可使用。\n' >&2
 fi
 python3 - "$ROOT" "$AGENT_PORT" <<'PY'
 import json

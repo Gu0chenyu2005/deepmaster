@@ -124,6 +124,50 @@ class WebRTCPreviewTests(unittest.TestCase):
         self.assertEqual(pipeline.states, ["NULL"])
         self.assertIsNone(self.preview.session)
 
+    def test_close_removes_probes_releases_request_pad_and_waits_for_null(self):
+        calls = []
+
+        class Pad:
+            def remove_probe(self, probe_id):
+                calls.append(("remove_probe", probe_id))
+
+        class Peer:
+            def release_request_pad(self, pad):
+                calls.append(("release_pad", pad))
+
+        class Pipeline:
+            def set_state(self, value):
+                calls.append(("set_state", value))
+
+            def get_state(self, timeout):
+                calls.append(("get_state", timeout))
+
+        pad, sink, pipeline = Pad(), object(), Pipeline()
+        self.preview.gst = SimpleNamespace(State=SimpleNamespace(NULL="NULL"), SECOND=1_000_000_000)
+        self.preview.session = {"id": "session", "pipeline": pipeline,
+                                "pc": Peer(), "sinks": [sink], "probes": [(pad, 7)]}
+        self.assertEqual(self.preview.close("session"), {"closed": True})
+        self.assertEqual(calls, [("remove_probe", 7), ("release_pad", sink),
+                                 ("set_state", "NULL"), ("get_state", 2_000_000_000)])
+
+    def test_missing_resize_permission_does_not_change_live_caps(self):
+        class Encoder:
+            def __init__(self):
+                self.values = []
+
+            def set_property(self, name, value):
+                self.values.append((name, value))
+
+        encoder, scaler = Encoder(), Encoder()
+        self.preview.gst = SimpleNamespace(Caps=SimpleNamespace(from_string=lambda value: value))
+        self.preview.session = {"id": "session", "encoders": {"wrist": encoder},
+                                "scalers": {"wrist": (scaler, (1280, 720))},
+                                "touched": 0}
+        result = self.preview.set_quality("session", "control_min")
+        self.assertTrue(result["ok"])
+        self.assertEqual(encoder.values, [("bitrate", 800000)])
+        self.assertEqual(scaler.values, [])
+
     def test_close_requires_a_nonempty_matching_session_id(self):
         self.preview.session = {"id": "active", "pipeline": object()}
         self.assertEqual(self.preview.close(""), {"closed": False})
@@ -160,7 +204,8 @@ class WebRTCPreviewTests(unittest.TestCase):
         self.preview.session = {"id": "session", "encoders": encoders,
                                 "scalers": {name: (scalers[name], (640, 480))
                                             for name in self.preview.readers},
-                                "touched": 0, "quality": "control"}
+                                "touched": 0, "quality": "control",
+                                "allow_hot_resize": True}
         result = self.preview.set_quality("session", "control_min")
         self.assertTrue(result["ok"])
         self.assertTrue(result["changed"])

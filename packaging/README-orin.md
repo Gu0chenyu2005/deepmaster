@@ -1,10 +1,9 @@
 # 采集端
 
-Ubuntu aarch64，需已安装 ROS Humble 和 RealSense 驱动：
+Jetson Orin aarch64，需预装 NVIDIA JetPack、ROS 2 Humble 和 librealsense 驱动。部署包内含 Ubuntu Jammy arm64 的离线系统依赖；安装时无需联网。远控仅控制还需要与系统驱动匹配的 `pyrealsense2`。依赖清单见 `third_party/dependencies.json`。
 
 ```bash
-sudo apt-get install -y zstd
-sudo tar --zstd -xf orin-collect-*.tar.zst -C /opt
+sudo tar -xzf orin-collect-*.tar.gz -C /opt
 sudo bash /opt/dm-collect/install.sh
 ```
 

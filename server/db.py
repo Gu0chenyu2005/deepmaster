@@ -34,6 +34,20 @@ def connect():
         conn.close()
 
 
+@contextmanager
+def transaction():
+    """Run a read/modify/write operation under one immediate transaction."""
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+
+
 MIGRATIONS = []
 
 

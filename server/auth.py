@@ -10,26 +10,56 @@ import hmac
 import json
 import os
 import secrets
+import sqlite3
+import threading
 import time
 
 import db
 
 TOKEN_TTL = int(os.environ.get("DM_TOKEN_TTL", "86400"))   
+_SECRET_LOCK = threading.Lock()
+_SECRET_CACHE = None
 
 def _secret():
-    """优先使用环境变量中的签名密钥，否则生成并持久化。"""
+    """优先使用环境变量中的签名密钥，否则安全地生成并持久化。"""
+    global _SECRET_CACHE
     env = os.environ.get("DM_SECRET")
     if env:
         return env.encode()
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".secret")
-    if os.path.exists(path):
-        with open(path, "rb") as f:
-            return f.read()
-    val = secrets.token_bytes(32)
-    with open(path, "wb") as f:
-        f.write(val)
-    os.chmod(path, 0o600)
-    return val
+    with _SECRET_LOCK:
+        if _SECRET_CACHE is not None:
+            return _SECRET_CACHE
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            fd = None
+        if fd is not None:
+            with os.fdopen(fd, "rb") as f:
+                _SECRET_CACHE = f.read()
+            return _SECRET_CACHE
+
+        value = secrets.token_bytes(32)
+        temp = "%s.%d.%s.tmp" % (path, os.getpid(), secrets.token_hex(8))
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(value)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.link(temp, path)
+                _SECRET_CACHE = value
+            except FileExistsError:
+                existing = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                with os.fdopen(existing, "rb") as f:
+                    _SECRET_CACHE = f.read()
+            return _SECRET_CACHE
+        finally:
+            try:
+                os.unlink(temp)
+            except FileNotFoundError:
+                pass
 
 
 PBKDF2_ROUNDS = 200_000
@@ -99,7 +129,7 @@ def canon_role(role):
 
 def ensure_bootstrap_user():
     """无账号时创建初始管理员，返回 (account, password_or_None)。"""
-    with db.connect() as conn:
+    with db.transaction() as conn:
         row = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
         if row["n"] > 0:
             return None, None
@@ -177,6 +207,8 @@ def register(account, password, role="user", display_name=None):
         return False, {"code": 409, "message": "账号已存在"}
     try:
         info = create_user(account, password, role, display_name)
+    except sqlite3.IntegrityError:
+        return False, {"code": 409, "message": "账号已存在"}
     except Exception as e:
         return False, {"code": 500, "message": "创建账号失败：%s" % e}
     with db.connect() as conn:
@@ -197,7 +229,7 @@ def issue_reset_code(account, created_by=None):
     code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(10))
     expires = time.strftime("%Y-%m-%d %H:%M:%S",
                             time.localtime(time.time() + RESET_TTL_MIN * 60))
-    with db.connect() as conn:
+    with db.transaction() as conn:
 
         conn.execute("DELETE FROM reset_codes WHERE account=? AND used_at IS NULL", (account,))
         conn.execute(
@@ -218,20 +250,25 @@ def consume_reset_code(account, code, new_password, ip=None):
     if err:
         return False, {"code": 400, "message": err}
 
-    with db.connect() as conn:
+    with db.transaction() as conn:
+        now_s = db.now()
         row = conn.execute(
             "SELECT * FROM reset_codes WHERE code=? AND account=?", (code, account)).fetchone()
         if not row:
             return False, {"code": 400, "message": "重置码无效"}
         if row["used_at"]:
             return False, {"code": 400, "message": "该重置码已被使用"}
-        if row["expires_at"] < db.now():
+        if row["expires_at"] < now_s:
             return False, {"code": 400, "message": "重置码已过期，请重新申请"}
 
+        cur = conn.execute(
+            "UPDATE reset_codes SET used_at=?, used_ip=? "
+            "WHERE code=? AND account=? AND used_at IS NULL AND expires_at >= ?",
+            (now_s, ip, code, account, now_s))
+        if cur.rowcount != 1:
+            return False, {"code": 400, "message": "该重置码已被使用或已过期"}
         conn.execute("UPDATE users SET password_hash=? WHERE account=?",
                      (hash_password(new_password), account))
-        conn.execute("UPDATE reset_codes SET used_at=?, used_ip=? WHERE code=?",
-                     (db.now(), ip, code))
         db.audit(conn, account, "reset_password", account, ip)
     return True, {"account": account}
 
@@ -301,7 +338,7 @@ def set_user_role(account, role, by=None):
     if by and account == by:
         return False, {"code": 400, "message": "不能修改自己的权限"}
 
-    with db.connect() as conn:
+    with db.transaction() as conn:
         row = conn.execute("SELECT role FROM users WHERE account=?",
                            (account,)).fetchone()
         if not row:
@@ -324,7 +361,7 @@ def delete_user(account, by=None):
     if by and account == by:
         return False, {"code": 400, "message": "不能删除自己的账号"}
 
-    with db.connect() as conn:
+    with db.transaction() as conn:
         row = conn.execute("SELECT role FROM users WHERE account=?",
                            (account,)).fetchone()
         if not row:

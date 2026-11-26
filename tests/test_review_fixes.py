@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'server'))
 import agent
+import auth
 import cam
 import runner
 import db
@@ -22,7 +23,7 @@ with patch.object(sys, 'argv', ['api.py']):
 
 class ReviewFixTests(unittest.TestCase):
     def test_server_and_collector_runtime_versions_match_release(self):
-        self.assertEqual(api.APP_VERSION, "3.3.0")
+        self.assertEqual(api.APP_VERSION, "3.3.1")
         self.assertEqual(agent.VERSION, api.APP_VERSION)
 
     def test_data_reads_require_login_but_health_is_public(self):
@@ -47,6 +48,48 @@ class ReviewFixTests(unittest.TestCase):
                     raise RuntimeError("abort")
             with db.connect() as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM t").fetchone()[0], 0)
+
+    def test_sqlite_transaction_rolls_back_all_writes(self):
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+                os.environ, {"DM_DB": str(Path(root) / "test.db")}):
+            with db.connect() as conn:
+                conn.execute("CREATE TABLE t (value TEXT)")
+            with self.assertRaisesRegex(RuntimeError, "abort"):
+                with db.transaction() as conn:
+                    conn.execute("INSERT INTO t(value) VALUES ('first')")
+                    conn.execute("INSERT INTO t(value) VALUES ('second')")
+                    raise RuntimeError("abort")
+            with db.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM t").fetchone()[0], 0)
+
+    def test_reset_code_can_only_be_consumed_once_concurrently(self):
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+                os.environ, {"DM_DB": str(Path(root) / "test.db")}):
+            db.migrate()
+            auth.create_user("reset-user", "old-password-1")
+            issued, data = auth.issue_reset_code("reset-user")
+            self.assertTrue(issued)
+            barrier = threading.Barrier(2)
+            results = []
+
+            def consume(password):
+                barrier.wait()
+                results.append(auth.consume_reset_code(
+                    "reset-user", data["code"], password, "127.0.0.1"))
+
+            workers = [threading.Thread(target=consume, args=("new-password-%d" % i,))
+                       for i in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(10)
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+            self.assertEqual(sum(1 for ok, _ in results if ok), 1)
+            with db.connect() as conn:
+                row = conn.execute("SELECT password_hash FROM users WHERE account=?",
+                                   ("reset-user",)).fetchone()
+            self.assertTrue(any(auth.verify_password("new-password-%d" % i, row[0])
+                                for i in range(2)))
 
     def test_auto_qc_directory_is_reserved_and_empty_records_are_kept(self):
         self.assertTrue(auto_qc._is_reserved_output_folder("auto_qc"))
@@ -140,6 +183,65 @@ class ReviewFixTests(unittest.TestCase):
                 self.assertEqual(agent.STATE['cfg']['agent_token'], 'private')
         finally:
             agent.STATE.update(old)
+
+    def test_concurrent_agent_config_updates_are_atomic_and_protect_paths(self):
+        old = dict(agent.STATE)
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                config = Path(root) / 'host_config.json'
+                agent.STATE.update(cfg={'local_data_dir': root, 'rl_deploy_dir': '/opt/dm-collect/prog'},
+                                   cfg_path=str(config), data_root=root)
+                barrier = threading.Barrier(8)
+
+                def update(index):
+                    barrier.wait()
+                    return agent.save_cfg({'setting_%d' % index: str(index),
+                                           'rl_deploy_dir': '/tmp/attacker'})
+
+                threads = [threading.Thread(target=update, args=(i,)) for i in range(8)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(5)
+                self.assertTrue(all(not thread.is_alive() for thread in threads))
+                saved = json.loads(config.read_text())
+                self.assertEqual(saved['rl_deploy_dir'], '/opt/dm-collect/prog')
+                self.assertEqual({saved['setting_%d' % i] for i in range(8)},
+                                 {str(i) for i in range(8)})
+        finally:
+            agent.STATE.update(old)
+
+    def test_failed_process_spawn_closes_log_descriptor(self):
+        log = Mock()
+        with patch.object(runner, '_log_size', return_value=0), \
+             patch.object(runner, '_logfile', return_value=log), \
+             patch.object(runner.subprocess, 'Popen', side_effect=OSError('spawn failed')):
+            result = runner.spawn('test-log-close', 'test', ['program'])
+        self.assertFalse(result['ok'])
+        log.close.assert_called_once()
+
+    def test_sethome_is_blocked_while_control_program_runs(self):
+        with patch.object(runner, '_dry', return_value=False), \
+             patch.object(runner, '_alive', return_value=True), \
+             patch.object(runner, 'pgrep_count', return_value=0), \
+             patch.object(runner, '_dds_run') as dds:
+            result = runner.run_tare({'rl_deploy_bin': 'rl_deploy'})
+        self.assertFalse(result['ok'])
+        dds.assert_not_called()
+
+    def test_empty_cleanup_never_removes_input_root_or_nonempty_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            input_root = Path(root) / 'input'
+            child = input_root / 'record_data_20261126_1'
+            input_root.mkdir()
+            child.mkdir()
+            (child / 'notes.txt').write_text('preserve')
+            self.assertFalse(auto_qc._remove_empty_input_folder(input_root, input_root))
+            self.assertFalse(auto_qc._remove_empty_input_folder(child, input_root))
+            self.assertTrue(child.exists())
+            (child / 'notes.txt').unlink()
+            self.assertTrue(auto_qc._remove_empty_input_folder(child, input_root))
+            self.assertFalse(child.exists())
 
     def test_unmanaged_control_is_not_reported_stopped(self):
         with patch.object(runner, '_alive', return_value=False), \

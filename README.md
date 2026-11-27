@@ -6,7 +6,7 @@
 
 足臂机器人数据采集与审核平台。DeepMaster 将网页服务、采集端设备代理和浏览器操作界面分开部署，用于设备管理、三相机预览、遥操作采集、数据清洗、审核和数据集导出。
 
-当前版本：`v3.2.1-beta`
+当前版本：`v3.3.2-beta`
 
 ## 功能
 
@@ -57,7 +57,7 @@ flowchart LR
 GitHub Release 提供源代码压缩包，不附带预编译的服务端包或采集端包。服务端部署包可从源码构建：
 
 ```bash
-tar -xf deepmaster-3.2.1-beta.tar.gz
+tar -xf deepmaster-3.3.2-beta.tar.gz
 cd deepmaster
 ./make-packages.sh server
 ```
@@ -68,7 +68,7 @@ cd deepmaster
 DM_PROGRAM_SOURCE=/path/to/orin-progs ./make-packages.sh orin
 ```
 
-脚本检查所需程序、运行库及 ARM64 运行时后生成 `dist/orin-collect-v3.2.1-beta-*.tar.zst`。服务端生成 `dist/server-review-v3.2.1-beta-*.tar.gz`。构建成功后，分别按照 [`packaging/README-server.md`](packaging/README-server.md) 和 [`packaging/README-orin.md`](packaging/README-orin.md) 安装；服务端网页默认端口为 `8790`，API 默认端口为 `8765`，采集端代理端口由设备发现与配置确定。
+脚本检查所需程序、运行库及 ARM64 运行时后生成 `dist/orin-collect-v3.3.2-beta-*.tar.gz`。服务端生成 `dist/server-review-v3.3.2-beta-*.tar.gz`。构建成功后，分别按照 [`packaging/README-server.md`](packaging/README-server.md) 和 [`packaging/README-orin.md`](packaging/README-orin.md) 安装；服务端网页默认端口为 `8790`，API 默认端口为 `8765`，采集端代理端口由设备发现与配置确定。
 
 ## 测试
 

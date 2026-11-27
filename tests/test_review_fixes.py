@@ -23,7 +23,7 @@ with patch.object(sys, 'argv', ['api.py']):
 
 class ReviewFixTests(unittest.TestCase):
     def test_server_and_collector_runtime_versions_match_release(self):
-        self.assertEqual(api.APP_VERSION, "3.3.1")
+        self.assertEqual(api.APP_VERSION, "3.3.2-beta")
         self.assertEqual(agent.VERSION, api.APP_VERSION)
 
     def test_data_reads_require_login_but_health_is_public(self):

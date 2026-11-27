@@ -30,7 +30,12 @@ import cam        # noqa: E402
 import runner     # noqa: E402
 import system     # noqa: E402
 
-VERSION = "3.3.1"
+VERSION = "3.3.2-beta"
+
+# 采集端 offer() 的内部预算为 22s（PLAYING 3s + 编码就绪 8s + SDP promise 5s
+# + ICE 6s）。代理必须比它长，否则会截断采集端自己的诊断信息，页面只能
+# 看到笼统的超时。
+WEBRTC_SIGNAL_TIMEOUT = 25
 
 STATUS_PATTERNS = {
     "k7master3": ["K7Master3"],
@@ -653,7 +658,7 @@ class Handler(BaseHTTPRequestHandler):
                     headers={"Content-Type": "application/json",
                              "X-DM-WebRTC-Token": STATE.get("webrtc_token", "")},
                     method="POST")
-                with urlopen(request, timeout=20) as response:
+                with urlopen(request, timeout=WEBRTC_SIGNAL_TIMEOUT) as response:
                     return self._ok(json.loads(response.read() or b"{}"))
             except Exception as exc:  # noqa: BLE001
                 from urllib.error import HTTPError
@@ -789,7 +794,7 @@ class Handler(BaseHTTPRequestHandler):
                     headers={"Content-Type": "application/json",
                              "X-DM-WebRTC-Token": STATE.get("webrtc_token", "")},
                     method="POST")
-                with urlopen(request, timeout=20) as response:
+                with urlopen(request, timeout=WEBRTC_SIGNAL_TIMEOUT) as response:
                     return self._ok(json.loads(response.read() or b"{}"))
             except Exception as exc:  # noqa: BLE001
                 from urllib.error import HTTPError

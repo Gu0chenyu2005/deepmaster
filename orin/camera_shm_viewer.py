@@ -964,6 +964,7 @@ class Handler(BaseHTTPRequestHandler):
                         time.sleep(0.2)
                     stale_sent = True
                 else:
+                    # fps=0 表示不限制（远控仅控制按源帧率出图）
                     limit = settings["fps"]
                     wait = (1.0 / limit - (time.monotonic() - last_emit)) if limit else 0
                     if wait > 0:

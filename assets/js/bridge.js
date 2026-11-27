@@ -122,7 +122,9 @@ Date November 2026
       return wrap("cam-start", cfg, onLine, mode ? { mode: mode } : null);
     },
     camStop: function (cfg, onLine) { return wrap("cam-stop", cfg, onLine); },
-    webrtcOffer: function (payload) { return post("/webrtc/offer", payload); },
+    // 信令预算链：采集端 22s < agent 25s < 浏览器 35s。
+    // 浏览器必须先于 agent 超时前拿到 agent 转发的采集端详细诊断。
+    webrtcOffer: function (payload) { return post("/webrtc/offer", payload, 35000); },
     webrtcClose: function (sessionId) {
       return post("/webrtc/close", { session_id: sessionId });
     },

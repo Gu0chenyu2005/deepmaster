@@ -51,7 +51,8 @@ async function main() {
 
   vm.runInContext(fs.readFileSync('assets/js/bridge.js', 'utf8'), ctx);
   const signaling = ctx.window.dmBridge.webrtcOffer({ session_id: 's', sdp: 'offer' });
-  assert.equal(timers[2].ms, 25000);
+  // 预算链：采集端 22s < agent 25s < 浏览器 35s
+  assert.equal(timers[2].ms, 35000, 'signaling must outlive the agent proxy timeout');
   timers[2].fn();
   await assert.rejects(signaling, error => error.code === 408 && /超时/.test(error.message));
 

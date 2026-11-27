@@ -19,13 +19,67 @@ QUALITY_PROFILES = {
 }
 
 
+MIN_OUTPUT_WIDTH = 640
+MIN_OUTPUT_HEIGHT = 360
+
+# 首帧由相机读线程送入，DirectCameraReader 的读帧上限是 5000ms；
+# 编码器就绪窗口必须大于它，再留出 PLAYING 切换与编码/打包时间。
+DIRECT_FRAME_TIMEOUT_MS = 5000
+ENCODER_READY_TIMEOUT = 8.0
+ICE_GATHERING_TIMEOUT = 6.0
+PIPELINE_PLAYING_TIMEOUT_NS = 3 * 1000000000
+# 三个 SDP promise（set-remote-description / create-answer / set-local-description）
+# 共用的最长等待时间。promise.wait() 不设限会无限阻塞，预算链就形同虚设。
+PROMISE_TIMEOUT_NS = 5 * 1000000000
+# 采集端整次 offer() 的预算上限：agent 的 HTTP 超时与浏览器信令超时都必须
+# 大于它，否则上游会先断开、页面只会看到含糊的"信令失败"。
+SIGNAL_BUDGET_SECONDS = (
+    PIPELINE_PLAYING_TIMEOUT_NS / 1000000000
+    + ENCODER_READY_TIMEOUT
+    + ICE_GATHERING_TIMEOUT
+    + PROMISE_TIMEOUT_NS / 1000000000
+)
+
+
+def pipeline_reached_playing(gst, pipeline, timeout_ns):
+    """确认管线已离开 NULL/READY，进入可接收数据的状态。
+
+    GStreamer 的 get_state() 返回 (StateChangeReturn, current, pending)，
+    第一个元素是"本次调用是否达成目标"的返回值，不是状态本身；
+    当前状态要看第二个元素 current。把返回值当状态比较会误判。
+
+    对 is-live 的 appsrc 而言，管线在收到首帧前停在 PAUSED（pending=playing），
+    推入数据后才转 PLAYING。等待首帧的阶段本来就处于 PAUSED，
+    因此这里只排除 NULL/READY，PAUSED 属于正常状态。
+    """
+    result, current, pending = pipeline.get_state(timeout_ns)
+    if current in (gst.State.NULL, gst.State.READY):
+        raise RuntimeError("H.264 管线未启动：%s（返回值 %s）" %
+                           (getattr(current, "value_nick", current),
+                            getattr(result, "value_nick", result)))
+    if current != gst.State.PLAYING:
+        # PAUSED/pending=PLAYING 是等待首帧时的正常状态。
+        print("[webrtc] 管线状态 %s（pending %s），等待首帧" %
+              (getattr(current, "value_nick", current),
+               getattr(pending, "value_nick", pending)), flush=True)
+    return True
+
+
 def quality_dimensions(width, height, scale):
-    """Return even output dimensions while retaining the 640x360 floor."""
+    """Return even output dimensions while retaining the 640x360 floor.
+
+    缩小后的宽高不得低于 640x360（源本身就更小时保持源尺寸），并且宽高
+    必须为偶数：nvv4l2h264enc 在 NV12 下对奇数尺寸会 configure 失败。
+    """
     width, height = max(2, int(width)), max(2, int(height))
-    floor = min(1.0, max(640 / width, 360 / height))
-    effective = max(float(scale), floor)
-    return (max(2, int(width * effective) // 2 * 2),
-            max(2, int(height * effective) // 2 * 2))
+    floor = min(1.0, max(MIN_OUTPUT_WIDTH / width, MIN_OUTPUT_HEIGHT / height))
+    effective = min(1.0, max(float(scale), floor))
+    target_w = int(width * effective)
+    target_h = int(height * effective)
+    if width >= MIN_OUTPUT_WIDTH and height >= MIN_OUTPUT_HEIGHT:
+        target_w = max(target_w, MIN_OUTPUT_WIDTH)
+        target_h = max(target_h, MIN_OUTPUT_HEIGHT)
+    return (max(2, target_w // 2 * 2), max(2, target_h // 2 * 2))
 
 
 def prefer_numeric_candidates(text):
@@ -167,6 +221,20 @@ class WebRTCPreview:
                 return {"ok": False, "cameras": {}}
             now = time.monotonic()
             cameras = {}
+
+            def _fresh_fps(rate_map, cam_name):
+                """帧率统计超过 1.5s 未更新即视为 0。
+
+                视频流中断后最后一次采样仍留在表里，若直接返回它，
+                前端会误判 publish/encode 正常而不降档，画面已黑却占着高码率。
+                """
+                sample = rate_map.get(cam_name)
+                if not sample:
+                    return 0
+                if "at" in sample and (now - sample["at"]) > 1.5:
+                    return 0.0
+                return sample.get("fps", 0)
+
             for name, reader in self.readers.items():
                 meta = reader._meta()
                 cameras[name] = {
@@ -175,8 +243,8 @@ class WebRTCPreview:
                     "capture_timeouts": meta.get("frame_timeouts", 0),
                     "capture_interval_ms": meta.get("capture_interval_ms"),
                     "queue_overwrites": self.slot_overwrites.get(name, 0),
-                    "publish_fps": state.get("publish_rate", {}).get(name, {}).get("fps", 0),
-                    "encode_fps": state.get("encode_rate", {}).get(name, {}).get("fps", 0),
+                    "publish_fps": _fresh_fps(state.get("publish_rate", {}), name),
+                    "encode_fps": _fresh_fps(state.get("encode_rate", {}), name),
                     "rtp_packets": state.get("rtp_counts", {}).get(name, 0),
                     "present": meta.get("present", False),
                     "exposure": meta.get("exposure", {}),
@@ -237,17 +305,32 @@ class WebRTCPreview:
                         print("[webrtc] video frames=%s rtp_packets=%s" %
                               (counts, packets), flush=True)
                     bus = state["pipeline"].get_bus()
-                    message_types = self.gst.MessageType.ERROR | self.gst.MessageType.EOS
-                    message = bus.pop_filtered(message_types) if bus is not None else None
                     failed = False
-                    while message:
-                        if message.type == self.gst.MessageType.ERROR:
-                            error, debug = message.parse_error()
-                            print("[webrtc] pipeline error: %s (%s)" % (error, debug), flush=True)
+                    if bus is not None:
+                        # pop_filtered 在部分 GStreamer 版本上不可用，退回 pop()
+                        pop_fn = getattr(bus, "pop", None)
+                        if pop_fn is not None:
+                            message = pop_fn()
+                            while message:
+                                if message.type == self.gst.MessageType.ERROR:
+                                    error, debug = message.parse_error()
+                                    print("[webrtc] pipeline error: %s (%s)" % (error, debug), flush=True)
+                                    failed = True
+                                elif message.type == self.gst.MessageType.EOS:
+                                    print("[webrtc] pipeline reached EOS", flush=True)
+                                    failed = True
+                                message = pop_fn()
                         else:
-                            print("[webrtc] pipeline reached EOS", flush=True)
-                        failed = True
-                        message = bus.pop_filtered(message_types)
+                            message_types = self.gst.MessageType.ERROR | self.gst.MessageType.EOS
+                            message = bus.pop_filtered(message_types)
+                            while message:
+                                if message.type == self.gst.MessageType.ERROR:
+                                    error, debug = message.parse_error()
+                                    print("[webrtc] pipeline error: %s (%s)" % (error, debug), flush=True)
+                                else:
+                                    print("[webrtc] pipeline reached EOS", flush=True)
+                                failed = True
+                                message = bus.pop_filtered(message_types)
                     if failed:
                         close_id = state["id"]
                     elif name == "connected":
@@ -262,7 +345,11 @@ class WebRTCPreview:
                             close_id = state["id"]
                     else:
                         state.pop("disconnected_at", None)
+                        # 正在协商（_await_encoders/_answer 未返回）的会话不能
+                        # 被这条"从未连上"规则回收，否则等待中的有效会话会被
+                        # monitor 中途关掉，表现为随机的信令失败。
                         if (not state.get("ever_connected")
+                                and not state.get("negotiating")
                                 and now - state.get("created_at", now) >= 20):
                             close_id = state["id"]
                 if close_id:
@@ -316,10 +403,36 @@ class WebRTCPreview:
                     "profile": profile, "bitrate": bitrate, "scale": scale}
 
     @staticmethod
-    def _promise_value(gst, element, signal, *args):
+    def _promise_value(gst, element, signal, *args, timeout_ns=None):
+        """等待 GStreamer Promise 应答。
+
+        Gst.Promise.wait() 没有超时参数，无限阻塞会让 SIGNAL_BUDGET_SECONDS
+        形同虚设。用 promise.interrupt() 从定时器线程打断：wait() 会立即
+        返回 INTERRUPTED，从而把等待限定在预算内。
+        """
         promise = gst.Promise.new()
         element.emit(signal, *args, promise)
-        if promise.wait() != gst.PromiseResult.REPLIED:
+        timeout_ns = timeout_ns if timeout_ns is not None else PROMISE_TIMEOUT_NS
+        timed_out = threading.Event()
+
+        def on_timeout():
+            timed_out.set()
+            try:
+                promise.interrupt()
+            except Exception:
+                pass
+
+        timer = threading.Timer(timeout_ns / 1000000000.0, on_timeout)
+        timer.daemon = True
+        timer.start()
+        try:
+            result = promise.wait()
+        finally:
+            timer.cancel()
+        if timed_out.is_set() or result == gst.PromiseResult.INTERRUPTED:
+            raise TimeoutError("GStreamer %s 等待应答超时（%dms）" %
+                               (signal, timeout_ns // 1000000))
+        if result != gst.PromiseResult.REPLIED:
             raise RuntimeError("GStreamer %s 未完成" % signal)
         reply = promise.get_reply()
         if reply is not None and reply.has_field("error"):
@@ -383,32 +496,50 @@ class WebRTCPreview:
                             # Start at the minimum bitrate; the browser raises quality after stability checks.
                             "quality": "control_min",
                             "allow_hot_resize": False,
+                            # 协商期间置位，阻止 monitor 按"从未连上"回收会话。
+                            "negotiating": True,
                             "sinks": []}
-            try:
-                self._build_pipeline(codecs)
-                return self._answer(remote)
-            except Exception:
-                self._close_locked(session_id)
-                raise
+        # 关键：等待编码器就绪与 SDP 应答都不能持有 self.lock。
+        # _push_frame() 需要同一把锁把首帧推进 appsrc，若在持锁状态下等待，
+        # 首帧永远送不进来，等待必然超时。
+        try:
+            self._build_pipeline(codecs)
+            self._await_encoders()
+            result = self._answer(remote)
+            with self.lock:
+                if self.session is not None:
+                    self.session["negotiating"] = False
+            return result
+        except Exception:
+            self.close(session_id)
+            raise
 
     def _build_pipeline(self, codecs):
         gst = self.gst
-        state = self.session
-        pipeline = state["pipeline"]
+        with self.lock:
+            state = self.session
+            if not state or state.get("closing"):
+                raise RuntimeError("WebRTC 会话已被关闭")
+            pipeline = state["pipeline"]
         pc = gst.ElementFactory.make("webrtcbin", "peer")
         if pc is None:
             raise RuntimeError("无法创建 webrtcbin")
         pc.set_property("bundle-policy", self.webrtc.WebRTCBundlePolicy.MAX_BUNDLE)
         pipeline.add(pc)
         state["pc"] = pc
+        # codecs 按浏览器 SDP 的 m-line 顺序；track 名必须与同一 index 绑定，
+        # 否则浏览器 CAM_KEYS 顺序变化时 payload 会错配到别的相机。
         for index, name in enumerate(("wrist", "global", "third")):
             payload, profile = codecs[index]
             reader = self.readers.get(name)
             if reader is None or not reader._meta()["present"]:
                 raise RuntimeError("相机尚未就绪：%s" % name)
+            if profile not in ("baseline", "constrained-baseline"):
+                raise RuntimeError("相机 %s 不支持的 H.264 profile：%s" % (name, profile))
             with reader.lock:
                 width, height = reader.width, reader.height
                 pixel = str(reader.pixel_format).lower()
+                fps = max(1, min(int(reader.source_fps or 30), 60))
             fmt = "RGB" if "rgb8" in pixel else "BGR"
             if "yuyv" in pixel:
                 fmt = "YUY2"
@@ -420,12 +551,20 @@ class WebRTCPreview:
             src.set_property("block", False)
             src.set_property("do-timestamp", False)
             src.set_property("max-buffers", 1)
+            # appsrc 的 max-bytes 默认 200000，单帧 BGR 1280x720 就有 2.7MB，
+            # 会被判定超限而停止接收数据；显式设为 0 表示不限。
+            if src.find_property("max-bytes"):
+                src.set_property("max-bytes", 0)
+            if src.find_property("max-time"):
+                src.set_property("max-time", 0)
             if src.find_property("leaky-type"):
                 src.set_property("leaky-type", 2)
             caps = gst.Caps.from_string(
                 "video/x-raw,format=%s,width=%d,height=%d,framerate=%d/1" %
-                (fmt, width, height, max(1, min(int(reader.source_fps or 30), 60))))
+                (fmt, width, height, fps))
             src.set_property("caps", caps)
+            # 同一 fps 同时用于 caps 与 buffer duration，避免上游重协商。
+            state.setdefault("source_fps", {})[name] = fps
             pipeline.add(src)
             chain = [src]
             descriptions = [("queue", "max-size-buffers=1 leaky=downstream")]
@@ -448,10 +587,15 @@ class WebRTCPreview:
                 "video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d" %
                 (output_width, output_height)))
             encoder = gst.ElementFactory.make("nvv4l2h264enc", "h264-" + name)
-            encoder.set_property("profile", int(profile == "constrained-baseline"))
+            # L4T nvv4l2h264enc 的 profile 枚举与 v4l2 规范不同：
+            # 0=Baseline，1 非法，2=Main，4=High。浏览器只接受 Baseline，
+            # 固定用 0 避免写入非法值导致编码器 configure 失败。
+            encoder.set_property("profile", 0)
             encoder.set_property("bitrate", initial_bitrate)
             encoder.set_property("control-rate", 1)
             encoder.set_property("iframeinterval", 30)
+            if encoder.find_property("idrinterval"):
+                encoder.set_property("idrinterval", 30)
             encoder.set_property("insert-sps-pps", True)
             for prop, value in (("num-B-Frames", 0), ("maxperf-enable", True),
                                 ("low-latency", True)):
@@ -465,6 +609,9 @@ class WebRTCPreview:
             pay = gst.ElementFactory.make("rtph264pay", "pay-" + name)
             pay.set_property("pt", payload)
             pay.set_property("config-interval", 1)
+            # MTU 1200 与 WireGuard 的 1380 匹配，避免 UDP 分片丢包
+            if pay.find_property("mtu"):
+                pay.set_property("mtu", 1200)
             if pay.find_property("aggregate-mode"):
                 pay.set_property("aggregate-mode", 1)
             rtp_caps = gst.ElementFactory.make("capsfilter", "rtp-" + name)
@@ -503,6 +650,9 @@ class WebRTCPreview:
                 raise RuntimeError("无法添加 %s 视频轨道" % name)
             transceiver = sink.get_property("transceiver")
             transceiver.set_property("direction", self.webrtc.WebRTCRTPTransceiverDirection.SENDONLY)
+            # 开启 NACK 让浏览器能请求重传，降低丢包对画面的影响
+            if transceiver.find_property("do-nack"):
+                transceiver.set_property("do-nack", True)
             state["sinks"].append(sink)
             state["sources"][name] = (src, fmt, width, height)
             state["frame_counts"][name] = 0
@@ -510,36 +660,90 @@ class WebRTCPreview:
             state["scalers"][name] = (capsfilter, (width, height))
             state["rtp_pads"][name] = src_pad
         pipeline.set_state(gst.State.PLAYING)
+        # set_state 是非阻塞的；必须确认真的进入 PLAYING，否则此时喂帧会被
+        # 当成 FLUSHING 丢光，rtp_pads 永远拿不到 caps。
+        pipeline_reached_playing(gst, pipeline, PIPELINE_PLAYING_TIMEOUT_NS)
+        state["playing_at"] = time.monotonic()
 
-    def _answer(self, offer):
-        gst, pc = self.gst, self.session["pc"]
-        deadline = time.monotonic() + 4
+    def _await_encoders(self):
+        """等待三路编码器产出第一个 RTP 包。
+
+        首帧必须由相机读线程经 push() 送入 appsrc，而 DirectCameraReader
+        等待首帧的上限是 DIRECT_FRAME_TIMEOUT_MS=5s，因此这里的等待窗口
+        必须大于该值，否则冷启动必然超时。相机掉线时立即失败，不做无意义
+        的满额等待。
+
+        本方法不能长时间持有 self.lock：_push_frame() 需要同一把锁推帧，
+        持锁等待会让首帧永远送不进来。
+        """
+        deadline = time.monotonic() + ENCODER_READY_TIMEOUT
         while True:
-            pending = [name for name, pad in self.session["rtp_pads"].items()
+            with self.lock:
+                state = self.session
+                if not state or state.get("closing"):
+                    raise RuntimeError("WebRTC 会话已被关闭")
+                pads = dict(state["rtp_pads"])
+                counts = dict(state.get("frame_counts", {}))
+            pending = [name for name, pad in pads.items()
                        if pad.get_current_caps() is None]
             if not pending:
-                break
+                return
+            offline = [name for name in pending
+                       if not self.readers[name]._meta().get("present")]
+            if offline:
+                raise RuntimeError("相机尚未出帧：%s（已推帧 %s）" %
+                                   (", ".join(offline), counts))
             if time.monotonic() >= deadline:
-                raise TimeoutError("H.264 编码未就绪：%s" % ", ".join(pending))
+                present = {name: bool(self.readers[name]._meta().get("present"))
+                           for name in pads}
+                raise TimeoutError(
+                    "H.264 编码未就绪：%s（已推帧 %s，相机在线 %s）" %
+                    (", ".join(pending), counts, present))
             time.sleep(0.02)
-        self._promise_value(gst, pc, "set-remote-description", offer)
-        reply = self._promise_value(gst, pc, "create-answer", None)
+
+    def _answer(self, offer):
+        gst = self.gst
+        with self.lock:
+            state = self.session
+            if not state or state.get("closing"):
+                raise RuntimeError("WebRTC 会话已被关闭")
+            pc = state["pc"]
+        # 三个 promise 共用一份预算，避免逐个 5s 累加超出总预算。
+        promise_deadline = time.monotonic() + PROMISE_TIMEOUT_NS / 1000000000.0
+
+        def remaining():
+            left = promise_deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("WebRTC SDP 应答超时（%dms）" %
+                                   (PROMISE_TIMEOUT_NS // 1000000))
+            return int(left * 1000000000)
+
+        self._promise_value(gst, pc, "set-remote-description", offer,
+                            timeout_ns=remaining())
+        reply = self._promise_value(gst, pc, "create-answer", None,
+                                     timeout_ns=remaining())
         answer = reply.get_value("answer") if reply is not None else None
         if answer is None:
             raise RuntimeError("webrtcbin 无法创建 SDP answer")
-        self._promise_value(gst, pc, "set-local-description", answer)
-        deadline = time.monotonic() + 8
+        self._promise_value(gst, pc, "set-local-description", answer,
+                            timeout_ns=remaining())
+        deadline = time.monotonic() + ICE_GATHERING_TIMEOUT
         while pc.get_property("ice-gathering-state") != self.webrtc.WebRTCICEGatheringState.COMPLETE:
             if time.monotonic() >= deadline:
                 raise TimeoutError("WebRTC ICE 候选收集超时")
             time.sleep(0.05)
-        self.session["touched"] = time.monotonic()
         local = pc.get_property("local-description")
         candidates = [line.strip() for line in local.sdp.as_text().splitlines()
                       if line.startswith("a=candidate:")]
         print("[webrtc] gathered %d ICE candidates: %s" %
               (len(candidates), ", ".join(candidates[:6])), flush=True)
-        return {"session_id": self.session["id"], "sdp": local.sdp.as_text(),
+        with self.lock:
+            if self.session is state:
+                state["touched"] = time.monotonic()
+                session_id = state["id"]
+            else:
+                raise RuntimeError("WebRTC 会话已被关闭")
+        return {"session_id": session_id, "sdp": local.sdp.as_text(),
                 "type": "answer"}
 
     def push(self, name, data, width, height, pixel_format, captured_at):
@@ -575,10 +779,14 @@ class WebRTCPreview:
             buffer = self.gst.Buffer.new_allocate(None, len(data), None)
             buffer.fill(0, data)
             base_time = state["pipeline"].get_base_time()
+            if base_time == self.gst.CLOCK_TIME_NONE:
+                # 管线正在拆除时 base_time 无效，此刻推帧没有意义
+                return
             pts = int(captured_at * self.gst.SECOND) - int(base_time)
             buffer.pts = max(0, pts)
             buffer.dts = self.gst.CLOCK_TIME_NONE
-            fps = max(1, min(int(self.readers[name].source_fps or 30), 60))
+            fps = state.get("source_fps", {}).get(
+                name) or max(1, min(int(self.readers[name].source_fps or 30), 60))
             buffer.duration = self.gst.SECOND // fps
             try:
                 result = src.emit("push-buffer", buffer)
@@ -594,20 +802,32 @@ class WebRTCPreview:
         if not session_id:
             return {"closed": False}
         with self.lock:
-            return self._close_locked(session_id)
+            state = self._detach_locked(session_id)
+        if not state:
+            return {"closed": False}
+        # teardown 会阻塞在 pipeline.set_state(NULL) + get_state(2s) 上，
+        # 必须在锁外执行，否则这 2 秒内 _push_frame/_await_encoders/stats 全部冻结。
+        self._teardown_state(state)
+        return {"closed": True}
 
-    def _close_locked(self, session_id):
+    def _detach_locked(self, session_id):
+        """把会话从 self.session 摘下（必须在持锁时调用）。"""
         state = self.session
         if not state or state["id"] != session_id:
-            return {"closed": False}
+            return None
         state["closing"] = True
         self.session = None
+        return state
+
+    def _teardown_state(self, state):
+        """释放管线资源；不持有 self.lock。"""
         try:
             for pad, probe_id in state.get("probes", ()):
                 try:
                     pad.remove_probe(probe_id)
                 except Exception:
                     pass
+            state["probes"] = []
             pc = state.get("pc")
             if pc is not None:
                 for sink in state.get("sinks", []):
@@ -621,10 +841,22 @@ class WebRTCPreview:
                 get_state(2 * self.gst.SECOND)
         except Exception:
             pass
+        # 清空引用，避免已拆除的会话继续持有编码器与 pad
+        for key in ("sources", "encoders", "scalers", "rtp_pads"):
+            if isinstance(state.get(key), dict):
+                state[key].clear()
+        state["pc"] = None
         for name, condition in self.frame_conditions.items():
             with condition:
                 self.frame_slots[name] = None
                 condition.notify_all()
+
+    def _close_locked(self, session_id):
+        """持锁版本的关闭：先摘下会话，teardown 放到锁外。"""
+        state = self._detach_locked(session_id)
+        if not state:
+            return {"closed": False}
+        self._teardown_state(state)
         return {"closed": True}
 
 

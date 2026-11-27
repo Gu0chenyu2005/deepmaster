@@ -1042,6 +1042,7 @@ Date November 2026
   }
 
   function startControlLatency() {
+    if (controlMetricTimer) { clearInterval(controlMetricTimer); controlMetricTimer = null; }
     var panel = $("#cap-latency");
     if (panel) { panel.hidden = false; }
     controlHistory = [];
@@ -1207,6 +1208,11 @@ Date November 2026
     previewGeneration++;
     var generation = previewGeneration;
     clearRemoteRenderers();
+    /* 释放上一轮的 blob URL，避免长时间遥控累积内存 */
+    Object.keys(previewUrls).forEach(function (cam) {
+      try { if (previewUrls[cam]) { URL.revokeObjectURL(previewUrls[cam]); } } catch (e) {}
+    });
+    previewUrls = {};
     Object.keys(previewControllers).forEach(function (cam) {
       try { previewControllers[cam].abort(); } catch (e) {}
     });
@@ -1345,7 +1351,13 @@ Date November 2026
       }
       var fps = $('[data-cam-fps="' + cam + '"]');
       if (fps) { fps.textContent = ""; }
-      try { video.pause(); video.srcObject = null; video.remove(); } catch (e) {}
+      try {
+        /* 必须显式 stop() 轨道，否则接收端仍在占用解码器与带宽 */
+        if (video.srcObject && typeof video.srcObject.getTracks === "function") {
+          video.srcObject.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
+        }
+        video.pause(); video.srcObject = null; video.remove();
+      } catch (e) {}
       var img = $("#cap-img-" + cam);
       if (img) { img.hidden = false; }
       var panel = img && img.closest(".cap-cam");
@@ -1416,14 +1428,23 @@ Date November 2026
       var serverStats = results[1];
       var received = 0, lost = 0, frames = 0, bytes = 0, rtt = 0, rttCount = 0;
       var jitter = 0, jitterCount = 0;
+      var selectedPairId = "";
+      /* 优先用 transport 报告的选中候选对，避免把未选中的 pair 的 RTT 也算进来 */
+      report.forEach(function (item) {
+        if (item.type === "transport" && item.selectedCandidatePairId) {
+          selectedPairId = item.selectedCandidatePairId;
+        }
+      });
       report.forEach(function (item) {
         if (item.type === "inbound-rtp" && (item.kind === "video" || item.mediaType === "video")) {
           received += Number(item.packetsReceived || 0);
-          lost += Number(item.packetsLost || 0);
+          lost += Math.max(0, Number(item.packetsLost || 0));
           frames += Number(item.framesDecoded || 0);
           bytes += Number(item.bytesReceived || 0);
           if (Number.isFinite(Number(item.jitter))) { jitter += Number(item.jitter) * 1000; jitterCount++; }
-        } else if (item.type === "candidate-pair" && item.selected && Number(item.currentRoundTripTime) > 0) {
+        } else if (item.type === "candidate-pair" && Number(item.currentRoundTripTime) > 0 &&
+            (item.id === selectedPairId || item.selected ||
+             (!selectedPairId && item.state === "succeeded" && item.nominated))) {
           rtt += Number(item.currentRoundTripTime) * 1000;
           rttCount++;
         }
@@ -1495,17 +1516,23 @@ Date November 2026
         controlQualityGood++;
       }
       var profiles = ["control", "control_low", "control_min"];
+      /* 记录本次操作对应的会话：请求返回时会话可能已被重连替换 */
+      var activeSession = controlPeerSession;
       if (controlQualityBad >= 2 && controlQualityIndex < profiles.length - 1) {
-        controlQualityIndex++;
+        var nextDown = controlQualityIndex + 1;
         controlQualityBad = 0;
         setRemoteStatus("网络拥塞，降低画质以保持帧率", true);
-        window.dmBridge.webrtcQuality(controlPeerSession, profiles[controlQualityIndex]).catch(function () {});
+        return window.dmBridge.webrtcQuality(activeSession, profiles[nextDown]).then(function () {
+          if (controlPeerSession === activeSession) { controlQualityIndex = nextDown; }
+        }).catch(function () {});
       } else if (controlQualityGood >= 8 && controlQualityIndex > 0 &&
           !networkBad && !encodeBad && !sourceBad && !publishBad && !browserBad &&
           fps >= Math.max(1, sourceFps * 0.9)) {
-        controlQualityIndex--;
+        var nextUp = controlQualityIndex - 1;
         controlQualityGood = 0;
-        window.dmBridge.webrtcQuality(controlPeerSession, profiles[controlQualityIndex]).catch(function () {});
+        return window.dmBridge.webrtcQuality(activeSession, profiles[nextUp]).then(function () {
+          if (controlPeerSession === activeSession) { controlQualityIndex = nextUp; }
+        }).catch(function () {});
       }
     }).catch(function () {}).finally(function () { controlQualityPending = false; });
   }
@@ -1526,6 +1553,9 @@ Date November 2026
     return new Promise(function (resolve, reject) {
       var timeout = setTimeout(function () {
         peer.removeEventListener("icegatheringstatechange", changed);
+        /* 收集超时但 SDP 里已有候选时仍可建连，不应直接判失败 */
+        var sdp = peer.localDescription && peer.localDescription.sdp || "";
+        if (sdp.indexOf("a=candidate:") >= 0) { resolve(); return; }
         reject(new Error("ICE 候选收集超时"));
       }, timeoutMs);
       function changed() {
@@ -1615,8 +1645,14 @@ Date November 2026
 
   function scheduleControlReconnect(cfg, generation, grace) {
     if (!running || captureMode !== "control" || generation !== previewGeneration || controlReconnectTimer) { return; }
-    var delay = Math.max(grace || 0, Math.min(8000, 500 * Math.pow(2, Math.min(controlReconnectAttempts++, 4))));
-    setRemoteStatus("H.264 视频连接中断，正在重连", true);
+    var attempt = controlReconnectAttempts++;
+    var delay = Math.max(grace || 0, Math.min(8000, 500 * Math.pow(2, Math.min(attempt, 4))));
+    /* 连续失败 4 次后提示具体原因，避免页面无限循环"正在重试"让人无从判断。 */
+    if (attempt > 0 && attempt % 4 === 0) {
+      setRemoteStatus("H.264 视频连接持续失败（已尝试 " + attempt + " 次），请检查采集端相机与编码状态", true);
+    } else {
+      setRemoteStatus("H.264 视频连接中断，正在重连", true);
+    }
     controlReconnectTimer = setTimeout(function () {
       controlReconnectTimer = null;
       if (!running || generation !== previewGeneration) { return; }
@@ -1647,6 +1683,8 @@ Date November 2026
       setRemoteStatus("采集端地址发现未就绪，请更新采集端后重试", true);
       return;
     }
+    /* 建新 peer 前先关掉上一个，避免两条连接同时占用带宽 */
+    closeControlPeer();
     var peer = new RTCPeerConnection({
       iceServers: [{ urls: "stun:" + stunHost + ":" + stunPort }]
     });
@@ -1696,7 +1734,7 @@ Date November 2026
       setRemoteStatus("采集端 H.264 直连视频已连接", false);
     };
     peer.onconnectionstatechange = function () {
-      if (!running || generation !== previewGeneration) { return; }
+      if (!running || generation !== previewGeneration || peer !== controlPeer) { return; }
       if (peer.connectionState === "connected") {
         if (controlReconnectTimer) {
           clearTimeout(controlReconnectTimer);
@@ -1708,23 +1746,31 @@ Date November 2026
         scheduleControlReconnect(cfg, generation, peer.connectionState === "disconnected" ? 2500 : 0);
       }
     };
-    startControlVideoQuality();
     peer.createOffer().then(function (offer) {
-      if (generation !== previewGeneration) { throw new Error("预览已关闭"); }
+      if (!running || generation !== previewGeneration || peer !== controlPeer) { throw new Error("预览已关闭"); }
       return peer.setLocalDescription(offer);
     }).then(function () {
       return waitForIceGathering(peer, 10000);
     }).then(function () {
-      if (generation !== previewGeneration) { throw new Error("预览已关闭"); }
+      if (!running || generation !== previewGeneration || peer !== controlPeer) { throw new Error("预览已关闭"); }
       return bridge.webrtcOffer({ session_id: id, sdp: peer.localDescription.sdp });
     }).then(function (answer) {
+      if (!running || generation !== previewGeneration || peer !== controlPeer) {
+        /* 期间已被新会话取代：主动清理这个 peer 与它的采集端会话 */
+        try { peer.close(); } catch (e) {}
+        if (bridge && bridge.webrtcClose) { bridge.webrtcClose(id).catch(function () {}); }
+        return;
+      }
       if (!answer || answer.type !== "answer" || !answer.sdp) { throw new Error("采集端返回的 SDP answer 无效"); }
       midMap = parseVideoMids(answer.sdp);
       return peer.setRemoteDescription({ type: answer.type, sdp: answer.sdp }).then(function () {
-        return window.dmBridge.webrtcQuality(controlPeerSession, "control_min").catch(function () {});
+        if (!running || generation !== previewGeneration || peer !== controlPeer) { return; }
+        /* 连接建立后再启动码率自适应，避免在连接未就绪时统计出假数据 */
+        startControlVideoQuality();
+        return window.dmBridge.webrtcQuality(id, "control_min").catch(function () {});
       });
     }).catch(function (error) {
-      if (!running || generation !== previewGeneration) { return; }
+      if (!running || generation !== previewGeneration || peer !== controlPeer) { return; }
       scheduleControlReconnect(cfg, generation);
       setRemoteStatus("H.264/WebRTC 建连失败，正在重试：" + (error.message || error), true);
     });
@@ -1758,6 +1804,8 @@ Date November 2026
         controlReconnectAttempts = 0;
         startControlWebRTC(cfg, generation);
         startCamWatchdog(cfg);
+        // 三路视频全部出帧是遥操作启动的前置条件；超时必须向上抛出，
+        // 由启动流程统一终止，后台重连不能绕过这道门控。
         return waitForControlVideoFrames(generation, 30000);
       }
       CAM_KEYS.forEach(function (cam) { runRemoteStream(cam, cfg, generation); });

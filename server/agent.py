@@ -30,7 +30,7 @@ import cam        # noqa: E402
 import runner     # noqa: E402
 import system     # noqa: E402
 
-VERSION = "3.3.2-beta"
+VERSION = "3.3.2"
 
 # 采集端 offer() 的内部预算为 22s（PLAYING 3s + 编码就绪 8s + SDP promise 5s
 # + ICE 6s）。代理必须比它长，否则会截断采集端自己的诊断信息，页面只能

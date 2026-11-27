@@ -23,8 +23,50 @@ with patch.object(sys, 'argv', ['api.py']):
 
 class ReviewFixTests(unittest.TestCase):
     def test_server_and_collector_runtime_versions_match_release(self):
-        self.assertEqual(api.APP_VERSION, "3.3.2-beta")
+        self.assertEqual(api.APP_VERSION, "3.3.2")
         self.assertEqual(agent.VERSION, api.APP_VERSION)
+
+    def test_episode_frames_accept_a_directory_signature(self):
+        """审核帧由 <img> 加载，无法带 Authorization 头，只能用 ?v= 目录签名。
+
+        签名与 /api/episodes 返回的 token 一致时放行；不一致时必须退回登录。
+        """
+        import hashlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = os.path.join(tmp, "ep")
+            os.makedirs(data_dir)
+            signature = hashlib.md5(data_dir.encode()).hexdigest()[:12]
+
+            handler = object.__new__(api.Handler)
+            handler._user = Mock(side_effect=PermissionError("login required"))
+            handler._send = Mock(return_value="frame-bytes")
+
+            with patch.object(api, "resolve_dir", return_value=data_dir), \
+                    patch.object(api, "_ep_frame", return_value=b"jpeg") as frame:
+                result = api.Handler._route_get(
+                    handler, ["episode", "0", "frame", "wrist", "150"],
+                    {"dir": [data_dir], "v": [signature]})
+                self.assertEqual(result, "frame-bytes")
+                frame.assert_called_once_with(0, data_dir, "wrist", 150)
+                handler._user.assert_not_called()
+
+    def test_episode_frames_fall_back_to_login_without_valid_signature(self):
+        """签名缺失或错误时不得绕过鉴权。"""
+        handler = object.__new__(api.Handler)
+        handler._user = Mock(side_effect=PermissionError("login required"))
+        handler._send = Mock()
+
+        with patch.object(api, "resolve_dir", return_value="/tmp/ep"), \
+                patch.object(api, "_ep_frame", return_value=b"jpeg") as frame:
+            for ticket in ("", "deadbeef0000"):
+                with self.assertRaises(PermissionError):
+                    api.Handler._route_get(
+                        handler, ["episode", "0", "frame", "wrist", "150"],
+                        {"dir": ["/tmp/ep"], "v": [ticket]})
+            frame.assert_not_called()
+            handler._send.assert_not_called()
 
     def test_data_reads_require_login_but_health_is_public(self):
         handler = object.__new__(api.Handler)

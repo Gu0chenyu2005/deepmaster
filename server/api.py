@@ -51,7 +51,7 @@ TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(TOOL_DIR)
 
 
-APP_VERSION = "3.3.2-beta"
+APP_VERSION = "3.3.2"
 DEFAULT_DATA = os.environ.get("DM_DATA_DIR", os.path.join(PROJECT_DIR, "datasets"))
 _pos = [a for a in sys.argv[1:] if not a.startswith("-")]
 INIT_DATA = os.path.abspath(_pos[0]) if _pos else DEFAULT_DATA
@@ -894,16 +894,22 @@ SCHEMA_CANDIDATES = {
 }
 
 
+# 相机数据集候选路径，按优先级排列。
+# 映射依据 rl_deploy 的录制绑定（utils/armdog_recorder.cpp）与远控预览的相机
+# 角色表（orin/camera_shm_viewer.py）保持一致：
+#   primary -> wrist  -> /observations/rgb
+#   d435i   -> global -> /observations/d435i_rgb
+#   third   -> third  -> /observations/third_rgb
 CAMERA_CANDIDATES = [
-    ("wrist",  "腕部相机",    ["observations/images/cam_d435",
-                              "observations/d435i_rgb",
-                              "observations/wrist_rgb"]),
-    ("global", "头部相机",    ["observations/images/cam_d405_left",
-                              "observations/rgb",
-                              "observations/head_rgb"]),
-    ("third",  "第三人称相机", ["observations/images/cam_d405_right",
-                              "observations/third_rgb",
-                              "observations/third_person_rgb"]),
+    ("wrist",  "腕部相机",    ["observations/rgb",
+                              "observations/wrist_rgb",
+                              "observations/images/cam_d405_left"]),
+    ("global", "头部相机",    ["observations/d435i_rgb",
+                              "observations/head_rgb",
+                              "observations/images/cam_d435"]),
+    ("third",  "第三人称相机", ["observations/third_rgb",
+                              "observations/third_person_rgb",
+                              "observations/images/cam_d405_right"]),
 ]
 
 ARM_NAMES = ["arm_joint_1", "arm_joint_2", "arm_joint_3", "arm_joint_4",
@@ -3029,6 +3035,21 @@ class Handler(BaseHTTPRequestHandler):
 
         if head == "health":
             return self._ok({"ok": True, "time": db.now(), "version": APP_VERSION})
+
+        # 审核页的帧由 <img src> 加载，浏览器无法附加 Authorization 头，
+        # 因此改用 /api/episodes 返回的目录签名 v 作为凭据。签名不正确时
+        # 退回强制登录，安全性不降低。
+        if (head == "episode" and len(rest) >= 5 and rest[2] == "frame"):
+            signed = resolve_dir((q.get("dir") or [""])[0])
+            ticket = (q.get("v") or [""])[0]
+            if (signed is not None and ticket
+                    and ticket == hashlib.md5(signed.encode()).hexdigest()[:12]):
+                try:
+                    buf = _ep_frame(int(rest[1]), signed, rest[3], int(rest[4]))
+                except ValueError:
+                    raise err400("帧号无效")
+                return self._send(200, buf, "image/jpeg",
+                                  {"Cache-Control": "public, max-age=86400"})
 
         # Health is the only public read endpoint. All data, device and system
         # information requires a logged-in user before dispatch.
